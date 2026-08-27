@@ -355,7 +355,9 @@ export const TUNING = {
     blockedSubBoost: 1.25,
 
     // ── combo / pickup / misc one-shots
-    comboMaxOctaves: 1,           // octave wrap ceiling so it never gets shrill
+    comboMaxOctaves: 3,           // octave ceiling. At 1 the ding stopped rising at
+                                  // combo 6 and combo 11 was bit-identical to it —
+                                  // the sound players chase has to keep climbing.
     comboGain: 0.60,
     comboSparkleAt: 8,            // combo at which an octave sparkle is layered in
     pickupGain: 0.55,

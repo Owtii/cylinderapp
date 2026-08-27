@@ -196,7 +196,13 @@ export class RollingLayer {
     }
 
     const massDark = Math.pow(1 / (mr > 0.01 ? mr : 0.01), 0.12);
-    const tCut = clamp(lerp(A.rollingCutoffMin, A.rollingCutoffMax, Math.pow(sp01, 0.7)) * massDark, 60, 14000);
+    // Mass darkens the rumble, but never below the tuned floor: at 400 t the
+    // darkening factor is 0.59, which would drag a 180 Hz idle down to ~106 Hz
+    // and turn the roll into mud.
+    const tCut = clamp(
+      lerp(A.rollingCutoffMin, A.rollingCutoffMax, Math.pow(sp01, 0.7)) * massDark,
+      A.rollingCutoffMin, A.rollingCutoffMax,
+    );
     const tRate = clamp(Math.pow(1 / (mr > 0.01 ? mr : 0.01), A.rollingRateExp) * (0.85 + 0.4 * sp01), 0.35, 2.2);
     const tPeak = clamp(A.rollingToneHz / Math.pow(mr > 0.01 ? mr : 0.01, 0.25), 34, 320);
 

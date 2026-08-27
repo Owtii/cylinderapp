@@ -126,10 +126,16 @@ export class Screens {
     mk('h1', 'wordmark', bt, 'TONNAGE');
     mk('p', 'tagline', bt, 'FIVE TONS OF STEEL · ONE HILL · EVERYTHING IN THE WAY');
 
+    // Touch devices are told to tap, not to click. The keyboard legend below is
+    // already hidden for them by the same media query.
+    const coarse = window.matchMedia('(any-pointer: coarse)').matches
+      && !window.matchMedia('(any-pointer: fine)').matches;
     const btn = mkButton('plate-btn start-btn', sheet);
     this.btnStart = btn;
-    mk('span', 'btn-main', btn, 'CLICK TO START');
-    mk('span', 'btn-sub', btn, 'CLICK ANYWHERE — AUDIO ARMS ON LAUNCH');
+    mk('span', 'btn-main', btn, coarse ? 'TAP TO START' : 'CLICK TO START');
+    mk('span', 'btn-sub', btn, coarse
+      ? 'TAP ANYWHERE — AUDIO ARMS ON LAUNCH'
+      : 'CLICK ANYWHERE — AUDIO ARMS ON LAUNCH');
 
     const strip = mk('div', 'loadstrip', sheet);
     this.elStartBarTrack = mk('div', 'bar', strip);

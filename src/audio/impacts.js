@@ -28,6 +28,21 @@ const P = makeParams();
 
 const VALID = Object.create(null);
 for (let i = 0; i < IMPACT_MATERIALS.length; i++) VALID[IMPACT_MATERIALS[i]] = true;
+
+/**
+ * Bank keys, built once. A pulverize can resolve thirty impacts in a frame and
+ * each needs three keys, so composing them with `'impact.' + mat + '.body'` was
+ * ninety short-lived strings per frame in the hottest path in the game.
+ */
+const KEYS = Object.create(null);
+for (let i = 0; i < IMPACT_MATERIALS.length; i++) {
+  const m = IMPACT_MATERIALS[i];
+  KEYS[m] = {
+    transient: 'impact.' + m + '.transient',
+    body: 'impact.' + m + '.body',
+    debris: 'impact.' + m + '.debris',
+  };
+}
 const FALLBACK_MATERIAL = 'concrete';
 
 export class ImpactPlayer {
@@ -135,7 +150,7 @@ export class ImpactPlayer {
       P.rate = rate * (1 + fxRng.spread(A.pitchJitter));
       P.pan = panC;
       P.protect = blocked;
-      this.bank.play(eng, 'impact.' + mat + '.transient', P);
+      this.bank.play(eng, KEYS[mat].transient, P);
     }
 
     // ── 2. body
@@ -149,7 +164,7 @@ export class ImpactPlayer {
       P.pan = panC * 0.8;
       P.when = now + A.bodyDelay;
       P.protect = blocked;
-      this.bank.play(eng, 'impact.' + mat + '.body', P);
+      this.bank.play(eng, KEYS[mat].body, P);
 
       // A blocker always gets the dead concrete slam on top, whatever it is
       // made of — that thud IS the "you hit a wall" feedback.
@@ -177,7 +192,7 @@ export class ImpactPlayer {
       if (plow) n = Math.max(1, Math.round(n * 0.6));
       if (busy > 0) n = Math.max(1, Math.round(n * (1 - A.densityDebrisCut * busy)));
       const dGain = A.debrisGain * inten * crowd * (blocked ? 0.25 : (plow ? 0.55 : 1));
-      const key = 'impact.' + mat + '.debris';
+      const key = KEYS[mat].debris;
       for (let i = 0; i < n; i++) {
         this._winDebris++;
         resetParams(P);

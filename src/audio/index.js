@@ -84,7 +84,19 @@ export class AudioSystem {
       if (onProgress) onProgress(1);
       return;
     }
-    if (!this._initPromise) this._initPromise = this._boot(onProgress);
+    if (!this._initPromise) {
+      const self = this;
+      // Clear the cached promise unless boot actually succeeded, so a transient
+      // failure (a blocked context, a render that threw) can be retried instead
+      // of resolving instantly with ready === false forever.
+      this._initPromise = this._boot(onProgress).then(function (v) {
+        if (!self._ready) self._initPromise = null;
+        return v;
+      }, function (err) {
+        self._initPromise = null;
+        throw err;
+      });
+    }
     return this._initPromise;
   }
 
@@ -176,13 +188,15 @@ export class AudioSystem {
     if (!this._ready || this._disposed) return;
     if (!(dt > 0)) dt = 0;
 
-    const speed = s && typeof s.speed === 'number' ? s.speed : 0;
-    const speed01 = s && typeof s.speed01 === 'number' ? s.speed01 : 0;
-    const mass = s && typeof s.mass === 'number' && s.mass > 0 ? s.mass : TUNING.player.startMass;
+    // isFinite, not typeof: NaN is a number, and a single NaN frame flows through
+    // damp() into the rolling/wind state and silences them for the rest of the run.
+    const speed = s && isFinite(s.speed) ? s.speed : 0;
+    const speed01 = s && isFinite(s.speed01) ? clamp01(s.speed01) : 0;
+    const mass = s && isFinite(s.mass) && s.mass > 0 ? s.mass : TUNING.player.startMass;
     const airborne = s ? (s.airborne === true || s.grounded === false) : false;
     const playing = s ? s.playing !== false : false;
-    const combo = s && typeof s.combo === 'number' ? s.combo : 0;
-    const timeScale = s && typeof s.timeScale === 'number' ? s.timeScale : 1;
+    const combo = s && isFinite(s.combo) ? s.combo : 0;
+    const timeScale = s && isFinite(s.timeScale) ? s.timeScale : 1;
 
     this.rolling.update(dt, speed, speed01, mass, !airborne, playing);
 
@@ -236,6 +250,8 @@ export class AudioSystem {
     const n = scale.length > 0 ? scale.length : 1;
     const c = Math.max(1, Math.floor(combo)) - 1;
     const idx = c % n;
+    // The ding has to keep rising — it is the sound players chase. Capping the
+    // octave made combo 11 bit-identical to combo 6.
     const oct = Math.min(A.comboMaxOctaves, Math.floor(c / n));
     const semi = scale[idx] + 12 * oct;
     const rootScale = A.comboRootHz / COMBO_BASE_HZ;
@@ -370,7 +386,12 @@ export class AudioSystem {
     }
 
     for (let i = 0; i < loops.length; i++) {
-      this._loadLoop(loops[i], manifest[loops[i]][0]);
+      // registerSamples accepts either a URL or an array of URLs, and the README
+      // documents the bare-string form. Indexing a string here would hand
+      // _loadLoop a single character.
+      const entry = manifest[loops[i]];
+      const url = typeof entry === 'string' ? entry : (entry && entry[0]);
+      this._loadLoop(loops[i], url);
     }
   }
 

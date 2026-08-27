@@ -40,7 +40,7 @@ often. Files load through Howler (`pool: TUNING.audio.howlPoolSize`) and Howler 
 | --- | --- |
 | `impact.<material>.transient` | the contact, 0 ms, very short |
 | `impact.<material>.body` | the material's voice, plays 15 ms later |
-| `impact.<material>.debris` | one tail one-shot; 2–5 are scattered over `debrisTailWindow` |
+| `impact.<material>.debris` | one grain cluster; several are scattered over `debrisTailWindow`. Each procedural variant already holds 3–6 grains, so one impact can fire twenty-plus individual hits — keep replacement files short and sparse or the tail smears |
 | `impact.sub` | 40–60 Hz sine layer under every hit |
 | `combo.ding` | the pentatonic reward |
 | `pickup.chime` | mass pickup |

@@ -88,6 +88,12 @@ function makeVoiceRecord() {
   };
 }
 
+// Voice handles pack a slot index and a generation counter into one int, so a
+// stale handle cannot act on a recycled voice. 16 index bits keeps the packing
+// valid for any maxVoices a designer might reasonably set.
+const VOICE_IDX_BITS = 16;
+const VOICE_IDX_MASK = 0xffff;
+
 export class AudioEngine {
   constructor() {
     this.ctx = null;
@@ -197,7 +203,7 @@ export class AudioEngine {
     if (this.muted) return 0;
     const m = this.volMaster * TUNING.audio.masterGain;
     if (name === 'music') return m * this.volMusic * TUNING.audio.musicGain;
-    if (name === 'ui') return m * TUNING.audio.uiGain;
+    if (name === 'ui') return m * this.volSfx * TUNING.audio.uiGain;
     return m * this.volSfx * TUNING.audio.sfxGain;
   }
 
@@ -220,7 +226,8 @@ export class AudioEngine {
     this._ramp(this.masterGain.gain, mv, t, 0.02);
     this._ramp(this.sfxIn.gain, this.volSfx * TUNING.audio.sfxGain, t, 0.02);
     this._ramp(this.musicGain.gain, this.volMusic * TUNING.audio.musicGain, t, 0.02);
-    this._ramp(this.uiIn.gain, TUNING.audio.uiGain, t, 0.02);
+    // UI rides the SFX slider — it is the only slider a player has for it.
+    this._ramp(this.uiIn.gain, this.volSfx * TUNING.audio.uiGain, t, 0.02);
   }
 
   _ramp(param, value, t, time) {
@@ -337,7 +344,7 @@ export class AudioEngine {
     rec.endTime = when + (dur > 0 ? dur : 0.05);
     rec.protect = p.protect === true;
 
-    return idx | (rec.gen << 8);
+    return idx | (rec.gen << VOICE_IDX_BITS);
   }
 
   /** Smoothly move a live voice's gain (used to swell the shared sub layer). */
@@ -360,8 +367,8 @@ export class AudioEngine {
 
   _recFromHandle(handle) {
     if (!this.ready || handle < 0) return null;
-    const idx = handle & 0xff;
-    const gen = handle >>> 8;
+    const idx = handle & VOICE_IDX_MASK;
+    const gen = handle >>> VOICE_IDX_BITS;
     if (idx >= this.voicePool.capacity) return null;
     const rec = this.voicePool.items[idx];
     if (!rec.active || rec.gen !== gen) return null;
@@ -369,7 +376,7 @@ export class AudioEngine {
   }
 
   stopVoice(handle, fade) {
-    const idx = handle & 0xff;
+    const idx = handle & VOICE_IDX_MASK;
     const rec = this._recFromHandle(handle);
     if (!rec) return;
     this._killVoice(idx, fade !== undefined ? fade : TUNING.audio.voiceStealFade);
@@ -450,7 +457,7 @@ export class AudioEngine {
 
   _retire(idx, rec) {
     rec.active = false;
-    rec.gen = (rec.gen + 1) & 0xfffff;
+    rec.gen = (rec.gen + 1) & 0x7fff;
     rec.src = null;
     rec.gainNode = null;
     rec.panNode = null;
