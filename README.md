@@ -9,9 +9,16 @@ decision in this codebase is in service of that.
 
 ```
 npm install
-npm run dev        # http://localhost:5173
+npm run dev              # http://localhost:5173
 npm run build && npm run preview
+
+npm run build:single     # dist-single/ — one JS file, nothing fetched at runtime
 ```
+
+`build:single` exists because the game has to be publishable as a single self-contained
+page: no code splitting, CSS and every asset inlined. There is nothing to fetch anyway —
+Rapier's WASM is base64-inlined by the `-compat` build, and every material and sound is
+generated in code.
 
 ## Controls
 
