@@ -31,7 +31,7 @@ const SCALE_X = new Array(SCALE_STEPS + 1);
 for (let i = 0; i <= SCALE_STEPS; i++) SCALE_X[i] = 'scaleX(' + (i / SCALE_STEPS) + ')';
 
 /** Where a popup goes when it is off-screen or dead. */
-const PARKED = 'translate3d(-9999px,-9999px,0)';
+const PARKED = '-9999px -9999px';
 
 const CLS_HUD = 'hud';
 const CLS_HUD_ON = 'hud on';
@@ -207,7 +207,7 @@ export class Hud {
     for (let i = 0; i < pc; i++) {
       const el = mk('div', CLS_POP, this.elPopups, '');
       el.style.animationDuration = U.popupLife + 's';
-      el.style.transform = PARKED;
+      el.style.translate = PARKED;
       this.popEls[i] = el;
     }
     this.popCursor = 0;
@@ -337,7 +337,7 @@ export class Hud {
     const el = this.popEls[idx];
     el.textContent = text;
     el.style.color = color;
-    el.style.transform = PARKED;
+    el.style.translate = PARKED;
     // Swapping between two identical animations restarts it without a reflow.
     this.popFlip[idx] ^= 1;
     el.className = this.popFlip[idx] ? CLS_POP_A : CLS_POP_B;
@@ -368,7 +368,7 @@ export class Hud {
       if (t >= life) {
         this.popAlive[i] = 0;
         el.className = CLS_POP;
-        el.style.transform = PARKED;
+        el.style.translate = PARKED;
         this.popLastX[i] = -9999;
         this.popLastY[i] = -9999;
         continue;
@@ -385,7 +385,7 @@ export class Hud {
         || _projX < -margin || _projX > width + margin
         || _projY < -margin || _projY > height + margin) {
         if (this.popLastX[i] !== -9999) {
-          el.style.transform = PARKED;
+          el.style.translate = PARKED;
           this.popLastX[i] = -9999;
           this.popLastY[i] = -9999;
         }
@@ -397,7 +397,7 @@ export class Hud {
       if (px !== this.popLastX[i] || py !== this.popLastY[i]) {
         this.popLastX[i] = px;
         this.popLastY[i] = py;
-        el.style.transform = 'translate3d(' + px + 'px,' + py + 'px,0)';
+        el.style.translate = px + 'px ' + py + 'px';
       }
     }
   }
@@ -440,7 +440,7 @@ export class Hud {
       this.popLastY[i] = -9999;
       const el = this.popEls[i];
       el.className = CLS_POP;
-      el.style.transform = PARKED;
+      el.style.translate = PARKED;
     }
     this.popCursor = 0;
   }
@@ -487,7 +487,9 @@ export class Hud {
       }
     }
 
-    const t10 = Math.round(iv / 100);
+    // Truncate, never round. This sits directly beside the kilogram reel, and a
+    // scale that reads 999 KG next to "1.0 T" is a scale nobody trusts.
+    const t10 = Math.floor(iv / 100);
     if (t10 !== this.tonnes10) {
       this.tonnes10 = t10;
       this.elTonnes.textContent = (t10 / 10).toFixed(1) + ' T';

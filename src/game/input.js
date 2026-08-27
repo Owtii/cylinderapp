@@ -10,6 +10,11 @@ import { clamp } from '../core/math.js';
  * Steering is reported as a -1..1 axis; all smoothing lives in the player's
  * steering model, not here, so touch and keyboard feel identical.
  */
+/** True for elements that own their own keyboard/pointer behaviour. */
+function isUiTarget(el) {
+  return !!(el && el.closest && el.closest('button, input, select, textarea, a, [data-ui]'));
+}
+
 export class Input {
   constructor(target) {
     this.target = target;
@@ -71,7 +76,13 @@ export class Input {
     switch (e.code) {
       case 'KeyA': case 'ArrowLeft': this.left = true; this.usingTouch = false; e.preventDefault(); break;
       case 'KeyD': case 'ArrowRight': this.right = true; this.usingTouch = false; e.preventDefault(); break;
-      case 'Space': this.tuckEdge = true; e.preventDefault(); break;
+      case 'Space':
+        // Never swallow Space while a control has focus — the run-end screen
+        // focuses RESTART, and preventDefault here would stop it activating.
+        if (isUiTarget(e.target) || isUiTarget(document.activeElement)) return;
+        this.tuckEdge = true;
+        e.preventDefault();
+        break;
       case 'KeyR': this.restartEdge = true; break;
       case 'Escape': case 'KeyP': this.pauseEdge = true; break;
       default: break;
@@ -97,7 +108,7 @@ export class Input {
   _onPointerDown(e) {
     if (this.pointerId !== -1) return;
     // Buttons and sliders own their own pointer; steering must not steal it.
-    if (e.target && e.target.closest && e.target.closest('button, input, select, a, [data-ui]')) return;
+    if (isUiTarget(e.target)) return;
     this.pointerId = e.pointerId;
     this.anchorX = e.clientX;
     this.pointerX = e.clientX;

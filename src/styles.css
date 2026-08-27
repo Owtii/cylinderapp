@@ -332,13 +332,21 @@ h1, h2, p { margin: 0; }
   position: absolute;
   top: 0;
   left: 0;
-  /* `translate` and `scale` are separate properties so the animation never
-     fights the per-frame `transform` the HUD writes. */
-  translate: -50% -100%;
+  /* Order matters. CSS applies translate, then rotate, then scale, then
+     transform — so `transform` is the INNERMOST of the four. The per-frame screen
+     position must therefore live in `translate` (outermost) and the static
+     centring in `transform`; the other way round, the pop animation's scale
+     multiplies the screen coordinates and every popup drifts toward the top-left
+     corner as it animates. */
+  translate: -9999px -9999px;
   scale: 0.6;
+  transform: translate(-50%, -100%);
+  /* Scale about the origin, not the box centre. With any other origin the pop
+     animation shifts the anchor by origin * (1 - scale), so a popup slides as it
+     grows instead of blooming out of the point it belongs to. */
+  transform-origin: 0 0;
   opacity: 0;
-  transform: translate3d(-9999px, -9999px, 0);
-  will-change: transform, opacity;
+  will-change: translate, opacity;
   white-space: nowrap;
   font-size: clamp(17px, 2.3vw, 30px);
   letter-spacing: 0.05em;
@@ -910,7 +918,10 @@ h1, h2, p { margin: 0; }
 }
 
 @media (max-width: 400px) {
-  .reel { font-size: clamp(26px, 11vw, 44px); }
+  /* Must stay SMALLER than the base rule, which yields 34px here. An 11vw clamp
+     made the "small screens" query grow the readout to 43px and drive it into the
+     score and distance plates. */
+  .reel { font-size: clamp(19px, 7vw, 30px); }
   .scale-title { letter-spacing: 0.18em; }
   .ticket-unit { width: 4ch; }
 }

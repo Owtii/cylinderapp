@@ -235,7 +235,11 @@ export const TUNING = {
     warmupChunks: 3,              // pure Warmup at the start of a run
     tensionCooldown: 1,           // high-tension chunks must be separated by >= this
     difficultyRampDistance: 2600, // metres to reach full difficulty
-    holeMinReactionTime: 1.5,     // s of visibility at current speed (validated at spawn)
+    // Holes are streamed in five chunks (400 m) ahead and marked with hazard
+    // chevrons, so at 45 m/s a player sees one roughly nine seconds out — the
+    // reaction budget comes from the streaming window, not from a spawn-time
+    // check. This value is the floor that window has to keep beating.
+    holeMinReactionTime: 1.5,     // s of visibility at current speed
     pickupGenerosityBase: 0.75,
     pickupGenerosityRamp: 0.5,    // added at full difficulty
 
@@ -266,7 +270,8 @@ export const TUNING = {
     pickupBigChance: [0.02, 0.10],  // [easy, hard] chance of the 5000 kg pickup
     pickupMidChance: [0.15, 0.30],  // [easy, hard] chance of the 1000 kg pickup
     warmupProps: [4, 8],          // [min, max] props per warmup chunk
-    warmupPickups: [2, 4],        // [min, max] before generosity scaling
+    warmupPickups: [4, 6],        // [min, max] before generosity scaling. The warmup
+                                  // is where the player learns that mass is the point.
     trafficRows: [3, 4],          // [min, max] rows of parked vehicles
     trafficGapLanes: [2, 1],      // [easy, hard] free lanes per row
     trafficSidewaysChance: 0.14,  // chance a vehicle is parked across the road
@@ -294,6 +299,8 @@ export const TUNING = {
     jumpRampWidth: 6.5,
     jumpRampLength: 9,
     jumpRampHeight: 2.6,          // world-space rise from the ramp entry to its lip
+    jumpRunUpClear: 14,           // m of clear approach before the ramp
+    jumpLandingClear: 30,         // m of clear flight path past the lip
     jumpBlockerChance: [0.35, 0.85], // [easy, hard] sail-over blocker present
     jumpBlockerOffset: [6, 11],   // [min, max] m past the ramp end (under the arc)
     jumpSideProps: [2, 5],

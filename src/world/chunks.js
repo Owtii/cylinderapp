@@ -127,8 +127,19 @@ function makeSpec() {
  * recycle a spec that is still on screen — and steady-state generation stays
  * allocation-free even though it runs every 80 metres.
  */
+/**
+ * The ring must outlive every chunk the generator holds. game.js reads
+ * `rec.spec.cells` LIVE (groundYAt, and the ground probe handed to the fragment
+ * system), so a spec recycled while its chunk is still on screen would silently
+ * hand the wrong hole map to physics. Size it from the streaming window with
+ * headroom rather than pinning a literal.
+ */
+const SPEC_RING_SIZE = Math.max(
+  16,
+  (TUNING.world.chunksAhead + TUNING.world.chunksBehind + 3) * 2,
+);
 const _specRing = [];
-for (let i = 0; i < 16; i++) _specRing.push(makeSpec());
+for (let i = 0; i < SPEC_RING_SIZE; i++) _specRing.push(makeSpec());
 let _specCursor = 0;
 
 function nextSpec(type) {
@@ -761,12 +772,21 @@ function buildJump(spec, rng, diff, generosity) {
     }
   }
 
-  // Side dressing, well clear of the run-up (the ramp margin enforces it).
+  // Side dressing. The run-up and the whole flight path stay clear: the point of
+  // a jump chunk is the rest beat, and the ramp margin alone only guards the
+  // wedge's own footprint, not the corridor the roller is committed to.
+  const clearFrom = rampD - G.jumpRunUpClear;
+  const clearTo = rampEnd + G.jumpLandingClear;
   const n = irange(rng, G.jumpSideProps);
   for (let i = 0; i < n; i++) {
     const key = rng.bool(0.35) ? pickVehicle(rng, diff) : pickLight(rng, diff);
-    tryPlace(spec, rng, key, rng.range(4, CHUNK_LEN - 4),
-      laneX(rng.int(0, LANES - 1)), 8, 3.0, rng.spread(0.25), 1);
+    let pd = rng.range(4, CHUNK_LEN - 4);
+    let px = laneX(rng.int(0, LANES - 1));
+    // Anything inside the corridor gets pushed to a lane the ramp does not use.
+    if (pd > clearFrom && pd < clearTo && Math.abs(px - rampX) < width * 0.5 + 3.5) {
+      px = rampX > 0 ? laneX(0) : laneX(LANES - 1);
+    }
+    tryPlace(spec, rng, key, pd, px, 8, 3.0, rng.spread(0.25), 1);
   }
 
   // Landing-zone reward: you get paid for committing to the ramp.
@@ -803,70 +823,125 @@ function buildJump(spec, rng, diff, generosity) {
 // worse than dying.
 const ROAD_W = ROAD_HALF * 2;
 const PASS_COLS = 48;                     // 0.5 m resolution across the road
-const PASS_DSTEP = 1.0;                   // metres between samples
+const PASS_DSTEP = 0.5;                   // metres between sweep samples
 const _passCol = new Int32Array(PASS_COLS);
 const _passTmp = new Int32Array(PASS_COLS);
 const _passCandidates = new Int32Array(64);
 
-/** Widest run of free columns in `cols` (entries < 0 are free), in metres. */
+const COL_FREE = -1;
+const COL_HOLE = -2;
+
+/** Widest run of clear road in `cols`, in metres. Only COL_FREE counts as clear. */
 function widestRun(cols) {
   const colW = ROAD_W / PASS_COLS;
   let best = 0;
   let run = 0;
   for (let i = 0; i < PASS_COLS; i++) {
-    if (cols[i] < 0) { run++; if (run > best) best = run; } else run = 0;
+    // `< 0` would count COL_HOLE as road and make the whole check blind to holes.
+    if (cols[i] === COL_FREE) { run++; if (run > best) best = run; } else run = 0;
   }
   return best * colW;
+}
+
+/**
+ * Heavy half-extents for a prop entry, preferring the rotation- and scale-corrected
+ * values place() already stored.
+ */
+const _passExt = { ex: 0, ez: 0 };
+function propExtents(p, def) {
+  if (p.ex > 0 && p.ed > 0) {
+    _passExt.ex = p.ex;
+    _passExt.ez = p.ed;
+    return _passExt;
+  }
+  const sc = p.scale > 0 ? p.scale : 1;
+  const c = Math.abs(Math.cos(p.rotY || 0));
+  const sn = Math.abs(Math.sin(p.rotY || 0));
+  _passExt.ex = (c * def.size[0] * 0.5 + sn * def.size[2] * 0.5) * sc;
+  _passExt.ez = (sn * def.size[0] * 0.5 + c * def.size[2] * 0.5) * sc;
+  return _passExt;
+}
+
+/** Remove one prop without allocating a splice result array. */
+function removePropAt(spec, idx) {
+  const arr = spec.props;
+  for (let i = idx; i < arr.length - 1; i++) arr[i] = arr[i + 1];
+  arr.length = arr.length - 1;
+}
+
+/**
+ * Check one cross-section and, while it is too tight, drop whichever heavy prop
+ * opens the widest gap. Returns true if the section ended up clear enough.
+ */
+function passSection(spec, d, minGap, floor) {
+  const colW = ROAD_W / PASS_COLS;
+  const row = clamp(Math.floor(d / CELL_D), 0, GRID_Z - 1);
+
+  for (let guard = 0; guard < 12; guard++) {
+    for (let i = 0; i < PASS_COLS; i++) {
+      const x = -ROAD_HALF + (i + 0.5) * colW;
+      const lane = clamp(Math.floor((x + ROAD_HALF) / LANE_WIDTH), 0, LANES - 1);
+      _passCol[i] = spec.cells[row * LANES + lane] === 1 ? COL_FREE : COL_HOLE;
+    }
+
+    let nCand = 0;
+    for (let pi = 0; pi < spec.props.length; pi++) {
+      const p = spec.props[pi];
+      const def = PROPS[p.key];
+      if (!def || def.threshold <= floor) continue;   // always breakable, never a wall
+      const e = propExtents(p, def);
+      if (d < p.d - e.ez || d > p.d + e.ez) continue;
+      let touched = false;
+      for (let i = 0; i < PASS_COLS; i++) {
+        if (_passCol[i] !== COL_FREE) continue;
+        const x = -ROAD_HALF + (i + 0.5) * colW;
+        if (Math.abs(x - p.x) < e.ex) { _passCol[i] = pi; touched = true; }
+      }
+      if (touched && nCand < _passCandidates.length) _passCandidates[nCand++] = pi;
+    }
+
+    if (widestRun(_passCol) >= minGap) return true;
+    if (nCand === 0) return false;          // holes only — the chunk builders own those
+
+    let bestProp = -1;
+    let bestWidth = -1;
+    for (let k = 0; k < nCand; k++) {
+      const pi = _passCandidates[k];
+      for (let i = 0; i < PASS_COLS; i++) _passTmp[i] = _passCol[i] === pi ? COL_FREE : _passCol[i];
+      const w = widestRun(_passTmp);
+      if (w > bestWidth) { bestWidth = w; bestProp = pi; }
+    }
+    if (bestProp < 0) return false;
+    removePropAt(spec, bestProp);
+  }
+  return false;
 }
 
 function ensurePassable(spec) {
   const minGap = TUNING.gen.minGapLanes * LANE_WIDTH - 0.5;
   const floor = TUNING.player.minMass;
-  const colW = ROAD_W / PASS_COLS;
 
-  for (let d = 0; d <= CHUNK_LEN; d += PASS_DSTEP) {
-    const row = clamp(Math.floor(d / CELL_D), 0, GRID_Z - 1);
-    for (let guard = 0; guard < 12; guard++) {
-      // occupancy: -1 free, -2 hole, >= 0 index of the heavy prop that blocks it
-      for (let i = 0; i < PASS_COLS; i++) {
-        const x = -ROAD_HALF + (i + 0.5) * colW;
-        const lane = clamp(Math.floor((x + ROAD_HALF) / LANE_WIDTH), 0, LANES - 1);
-        _passCol[i] = spec.cells[row * LANES + lane] === 1 ? -1 : -2;
-      }
-      let nCand = 0;
-      for (let pi = 0; pi < spec.props.length; pi++) {
-        const p = spec.props[pi];
-        const def = PROPS[p.key];
-        if (!def || def.threshold <= floor) continue;   // always breakable
-        const c = Math.abs(Math.cos(p.rotY || 0));
-        const sn = Math.abs(Math.sin(p.rotY || 0));
-        const ex = c * def.size[0] * 0.5 + sn * def.size[2] * 0.5;
-        const ez = sn * def.size[0] * 0.5 + c * def.size[2] * 0.5;
-        if (d < p.d - ez || d > p.d + ez) continue;
-        let touched = false;
-        for (let i = 0; i < PASS_COLS; i++) {
-          if (_passCol[i] !== -1) continue;
-          const x = -ROAD_HALF + (i + 0.5) * colW;
-          if (Math.abs(x - p.x) < ex) { _passCol[i] = pi; touched = true; }
-        }
-        if (touched && nCand < _passCandidates.length) _passCandidates[nCand++] = pi;
-      }
+  // A regular sweep, plus every heavy prop's leading and trailing edge. Prop `d`
+  // values are jittered to non-integers, so the tightest cross-section — where one
+  // row's trailing edge overlaps the next row's leading edge — almost never lands
+  // on a grid sample. Walking the edges puts a sample exactly where it matters.
+  for (let d = 0; d <= CHUNK_LEN; d += PASS_DSTEP) passSection(spec, d, minGap, floor);
 
-      if (widestRun(_passCol) >= minGap) break;
-      if (nCand === 0) break;                            // holes only — builders own that
-
-      // Remove whichever heavy prop opens the widest gap.
-      let bestProp = -1;
-      let bestWidth = -1;
-      for (let k = 0; k < nCand; k++) {
-        const pi = _passCandidates[k];
-        for (let i = 0; i < PASS_COLS; i++) _passTmp[i] = _passCol[i] === pi ? -1 : _passCol[i];
-        const w = widestRun(_passTmp);
-        if (w > bestWidth) { bestWidth = w; bestProp = pi; }
-      }
-      if (bestProp < 0) break;
-      spec.props.splice(bestProp, 1);
+  for (let pass = 0; pass < 2; pass++) {
+    let changed = false;
+    for (let pi = 0; pi < spec.props.length; pi++) {
+      const p = spec.props[pi];
+      const def = PROPS[p.key];
+      if (!def || def.threshold <= floor) continue;
+      const e = propExtents(p, def);
+      const before = spec.props.length;
+      const lead = p.d - e.ez;
+      const trail = p.d + e.ez;
+      if (lead >= 0 && lead <= CHUNK_LEN) passSection(spec, lead + 1e-3, minGap, floor);
+      if (trail >= 0 && trail <= CHUNK_LEN) passSection(spec, trail - 1e-3, minGap, floor);
+      if (spec.props.length !== before) { changed = true; pi = -1; }  // list shifted
     }
+    if (!changed) break;
   }
 }
 
@@ -896,7 +971,9 @@ export function buildChunk(type, ctx) {
  * copy what you need out of it before calling again.
  */
 export function chunkWeights(difficulty01) {
-  const t = clamp01(difficulty01);
+  // clamp01 passes NaN straight through, and NaN weights make Rng.pickWeighted
+  // miss its `total <= 0` guard and silently always return the last type.
+  const t = clamp01(difficulty01 > 0 ? difficulty01 : 0);
   const W = TUNING.gen.chunkTypeWeights;
   _weights.warmup = pair(W.warmup, t);
   _weights.traffic = pair(W.traffic, t);

@@ -165,6 +165,7 @@ export class Game {
     }
     await audio.resume();
     audio.reset();
+    this.screens.markLoaded();
     this._prepareWorld((Math.random() * 0xffffffff) >>> 0);
     this.screens.hideAll();
     this.hud.setVisible(true);

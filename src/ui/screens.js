@@ -72,6 +72,7 @@ export class Screens {
    * @param {object} cb {onStart,onRestart,onResume,onQuit,onVolume,onQuality}
    */
   constructor(root, cb) {
+    this.loaded = false;
     initSettings();
 
     this.root = root;
@@ -336,9 +337,17 @@ export class Screens {
 
   showStart() {
     this.starting = false;
-    this.setLoadProgress(0, 'STANDBY');
+    // Coming back from a run, everything is already built — rewinding the strip to
+    // 0 % / STANDBY would make a loaded game look like it had lost its assets.
+    if (this.loaded) this.setLoadProgress(1, 'READY');
+    else this.setLoadProgress(0, 'STANDBY');
     this._show('start');
     this._focus(this.btnStart);
+  }
+
+  /** Called once the game has finished building everything it loads up front. */
+  markLoaded() {
+    this.loaded = true;
   }
 
   showLoading() {

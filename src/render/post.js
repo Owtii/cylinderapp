@@ -130,7 +130,7 @@ export class PostFX {
     this.uSpeedWidth = uniform( num( P.speedLinesWidth, 0.3 ) );
     this.uSpeedRepeat = uniform( num( P.speedLinesRepeat, 3.2 ) );
     this.uSpeedScroll = uniform( num( P.speedLinesScroll, 2.6 ) );
-    this.uLineCount = uniform( 46 );
+    this.uLineCount = uniform( num( P.speedLinesCount, 46 ) );
     this.uDamageStrength = uniform( num( P.damageStrength, 0.9 ) );
     this.uDamageInner = uniform( num( P.damageInner, 0.12 ) );
     this.uFlashLevel = uniform( num( P.flashLevel, 3 ) );
@@ -217,7 +217,10 @@ export class PostFX {
       // respond to speed, and both collapse to zero below the threshold.
       const speedT = smoothstep( uSpeedThreshold, 1.0, uSpeed ).toVar();
 
-      const cell = atan( p.y, p.x ).mul( uLineCount ).div( TAU ).toVar();
+      // atan(0,0) is undefined in GLSL ES and WGSL alike, and on a buffer with odd
+      // width and height exactly one fragment lands on (0,0). A NaN there would
+      // poison the streak term for that pixel.
+      const cell = atan( p.y, p.x.add( 1e-6 ) ).mul( uLineCount ).div( TAU ).toVar();
       const rnd = hashLine( floor( cell ) ).toVar();
 
       const halfWidth = rnd.mul( uSpeedWidth ).add( 0.06 ).toVar();
@@ -229,7 +232,7 @@ export class PostFX {
       const radialMask = smoothstep( uSpeedInner, 1.0, r );
       const flow = r.mul( uSpeedRepeat )
         .add( rnd.mul( TAU ) )
-        .sub( uTime.mul( uSpeedScroll ).mul( speedT ) );
+        .sub( uTime );   // uTime is the integrated dash phase, not a wall clock
       const dash = sin( flow.mul( TAU ) ).mul( 0.32 ).add( 0.68 );
 
       const lines = core
@@ -397,16 +400,34 @@ export class PostFX {
     this.uFlashLevel.value = num( P.flashLevel, 3 );
   }
 
-  /** @private Wall clock for the speed-line scroll, wrapped to stay precise. */
+  /**
+   * @private
+   * Integrates the speed-line dash phase.
+   *
+   * The phase must be accumulated, not derived as `elapsed * scroll * speedGate`.
+   * With an absolute clock the phase carries a `t * d(speedGate)` term, so every
+   * change in speed jumps the dashes by an amount proportional to how long the
+   * session has been running — after a few minutes the streaks strobe on any
+   * acceleration. Integrating keeps the phase continuous no matter how the gate
+   * moves.
+   */
   _advanceClock() {
     const now = ( typeof performance !== 'undefined' ? performance.now() : Date.now() ) * 0.001;
     if ( this._clockStart < 0 ) this._clockStart = now;
-    let elapsed = now - this._clockStart;
-    if ( elapsed > TIME_WRAP || elapsed < 0 ) {
-      this._clockStart = now;
-      elapsed = 0;
-    }
-    this.uTime.value = elapsed;
+    let dt = now - this._clockStart;
+    this._clockStart = now;
+    if ( !( dt > 0 ) || dt > 0.25 ) dt = 0;   // first frame, or a tab that slept
+
+    const P = TUNING.post;
+    const thr = num( P.speedLinesThreshold, 0.88 );
+    const sp = this.uSpeed.value;
+    let gate = ( sp - thr ) / ( 1 - thr > 1e-4 ? 1 - thr : 1e-4 );
+    gate = gate < 0 ? 0 : gate > 1 ? 1 : gate;
+    gate = gate * gate * ( 3 - 2 * gate );    // matches the shader's smoothstep
+
+    let phase = this.uTime.value + this.uSpeedScroll.value * gate * dt;
+    if ( phase > TIME_WRAP || phase < 0 ) phase = phase % 1;   // dashes repeat at 1
+    this.uTime.value = phase;
   }
 
   // ────────────────────────────────────────────────────────────── teardown
