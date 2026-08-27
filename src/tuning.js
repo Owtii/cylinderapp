@@ -182,6 +182,8 @@ export const TUNING = {
     burstBlocked: 10,
     sparkCount: 18,
     flashLife: 0.08,
+    maxFlashesPerFrame: 6,        // additive flashes stack; past a handful a big
+                                  // pulverize just whites the screen out
     flashSize: 7.0,
 
     // ── integrator + look (src/fx/particles.js)

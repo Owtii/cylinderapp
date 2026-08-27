@@ -399,7 +399,16 @@ export class Game {
       ix, iy, iz, Math.round(burst * crowd + 3), particleColor,
       isPulv ? 13 : 7, 0.85, 1.05, false, 1.7, 0, 0.55, -0.6,
     );
-    this.particles.emitFlash(ix, iy, iz, TUNING.particles.flashSize * (isPulv ? 1 : 0.6), 0xfff4d8);
+    // Flashes are additive, so thirty of them in one frame white the screen out
+    // and hide the very thing they are meant to punctuate. The audio system thins
+    // a crowd the same way: past a handful, one big flash reads better than many.
+    if (this.frameImpacts <= TUNING.particles.maxFlashesPerFrame) {
+      this.particles.emitFlash(
+        ix, iy, iz,
+        TUNING.particles.flashSize * (isPulv ? 1 : 0.6) * (0.55 + 0.45 * crowd),
+        0xfff4d8,
+      );
+    }
     if (matKey === 'metal' || matKey === 'car' || matKey === 'heavy') {
       this.particles.emitSparks(ix, iy, iz, Math.round(TUNING.particles.sparkCount * crowd), 0, 0.5, -1);
     }
@@ -415,7 +424,7 @@ export class Game {
     this.chase.kickFov(TUNING.camera.fovKickAmount * (isPulv ? 1 : 0.6));
     this.loop.requestHitstop(hitstopFor(e.threshold, outcome));
     this.chromatic = Math.max(this.chromatic, isPulv ? 0.85 : 0.5);
-    this.flash = Math.max(this.flash, isPulv ? 0.28 : 0.14);
+    this.flash = Math.max(this.flash, (isPulv ? 0.28 : 0.14) * (0.5 + 0.5 * crowd));
 
     const gained = this.score.registerKill(e.threshold, outcome, this.loop.simTime);
     this.hud.setScore(this.score.points, this.score.combo);
