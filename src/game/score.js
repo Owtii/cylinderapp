@@ -10,6 +10,13 @@ import { PULVERIZE, PLOW } from '../physics/collisions.js';
 export class Score {
   constructor() {
     this.best = 0;
+    /**
+     * Ring buffer of kill timestamps for the slow-motion trigger. Allocated once
+     * and refilled with -Infinity rather than 0: simTime is 0 during the first
+     * fixed step of a run, so a zero sentinel makes those kills invisible to the
+     * trigger and silently costs a restart its first chain.
+     */
+    this.killTimes = new Float64Array(16);
     this.reset();
   }
 
@@ -20,7 +27,7 @@ export class Score {
     this.destroyed = 0;
     this.bestCombo = 1;
     this.peakMass = TUNING.player.startMass;
-    this.killTimes = new Float64Array(16);
+    this.killTimes.fill(-Infinity);
     this.killCursor = 0;
     this.lastDistanceScored = 0;
   }
@@ -52,7 +59,8 @@ export class Score {
     if (n > this.killTimes.length) return false;
     let count = 0;
     for (let i = 0; i < this.killTimes.length; i++) {
-      if (this.killTimes[i] > 0 && simTime - this.killTimes[i] <= windowSeconds) count++;
+      // Unused slots hold -Infinity, so the window test alone rejects them.
+      if (simTime - this.killTimes[i] <= windowSeconds) count++;
     }
     return count >= n;
   }
