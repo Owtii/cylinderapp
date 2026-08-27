@@ -396,7 +396,23 @@ export class FragmentSystem {
         y += vyi * dt;
         z += vzi * dt;
 
-        const r = this.radius[i];
+        // Half-extent of the box along world Y for its current orientation, from
+        // the second row of the rotation matrix. Using an orientation-independent
+        // inscribed radius instead lets a flat shard settle with most of its
+        // volume sunk into the road, which is very visible once debris comes to
+        // rest and never moves again.
+        const oqx = this.qx[i];
+        const oqy = this.qy[i];
+        const oqz = this.qz[i];
+        const oqw = this.qw[i];
+        const m10 = 2 * (oqx * oqy + oqw * oqz);
+        const m11 = 1 - 2 * (oqx * oqx + oqz * oqz);
+        const m12 = 2 * (oqy * oqz - oqw * oqx);
+        const r = 0.5 * (
+          (m10 < 0 ? -m10 : m10) * this.sx[i]
+          + (m11 < 0 ? -m11 : m11) * this.sy[i]
+          + (m12 < 0 ? -m12 : m12) * this.sz[i]
+        );
         const gy = probe(x, z);
 
         if (gy > -1e30) {

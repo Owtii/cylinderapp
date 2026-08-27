@@ -405,8 +405,11 @@ export const TUNING = {
     vignetteStrength: 0.5,
     chromaticMaxPixels: 2.0,
     chromaticDecay: 5.5,
-    speedLinesThreshold: 0.7,     // fraction of top speed
-    speedLinesStrength: 0.55,
+    // Cruise on the base slope already sits at ~0.96 of top speed, so a 0.7
+    // threshold left the streaks on permanently. They should mark a genuine burst
+    // — a steep section or a tuck — not ordinary rolling.
+    speedLinesThreshold: 0.88,    // fraction of top speed
+    speedLinesStrength: 0.20,
     blockedVignetteTime: 0.45,
     flashDecay: 7.0,
 
@@ -414,12 +417,15 @@ export const TUNING = {
     bloomResolutionScale: 0.5,    // internal bloom RT scale (0.5 = half res)
     vignettePower: 2.2,           // vignette falloff exponent (1 = linear, higher = tighter to the corners)
     speedLinesCount: 46,          // radial streaks around the full circle (rounded to an even number)
-    speedLinesInner: 0.34,        // normalised radius (0 centre, 1 corner) where streaks fade in
-    speedLinesWidth: 0.30,        // max streak half-width in cell units (< 0.5 or streaks merge)
+    speedLinesInner: 0.60,        // normalised radius (0 centre, 1 corner) where streaks fade
+                                  // in. It is a vignette: the centre stays clear.
+    speedLinesWidth: 0.24,        // max streak half-width in cell units (< 0.5 or streaks merge)
     speedLinesRepeat: 3.2,        // dash cycles along the radius
     speedLinesScroll: 2.6,        // outward dash scroll (cycles/s) at full speed
-    damageStrength: 0.9,          // how far the BLOCKED vignette pushes toward red at t=1
-    damageInner: 0.12,            // red still tints the screen centre by this fraction
+    // The player still has to steer through this flash, so the centre of the
+    // frame has to stay readable. Strong at the edges, light in the middle.
+    damageStrength: 0.72,         // how far the BLOCKED vignette pushes toward red at t=1
+    damageInner: 0.04,            // red still tints the screen centre by this fraction
     flashLevel: 3.0,              // linear-space white the flash blends toward (pre tone-mapping)
   },
 

@@ -38,7 +38,6 @@ const STATE_PLAYING = 'playing';
 const STATE_PAUSED = 'paused';
 const STATE_DEAD = 'dead';
 
-const _camPos = new THREE.Vector3();
 
 export class Game {
   constructor(container, hudRoot, screensRoot) {
@@ -511,8 +510,9 @@ export class Game {
     this.chase.update(rawDt, ix, iy, iz, p.d, speed01, p.mass, p.lateralVel);
     this.renderer.followLights(ix, iy, iz);
 
-    this.renderer.camera.getWorldPosition(_camPos);
-    this.particles.update(scaledDt, _camPos);
+    // The particle billboard basis comes out of the camera's world matrix, so it
+    // needs the camera itself rather than just its position.
+    this.particles.update(scaledDt, this.renderer.camera);
     this.fragments.update(scaledDt);
     this.props.flush();
     if (playing) this.generator.updatePickups(scaledDt, this.loop.simTime, ix, iy, iz, TUNING.mass.pickupMagnetRadius);

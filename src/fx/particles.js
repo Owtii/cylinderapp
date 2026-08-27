@@ -184,10 +184,8 @@ export class ParticleSystem {
     this._nx = 0; this._ny = 0; this._nz = 1;
 
     // ── focus point the basis aims at
-    this._fx = 0; this._fy = 0; this._fz = 0;
 
     // centroid accumulator, refilled every update
-    this._sumX = 0; this._sumY = 0; this._sumZ = 0; this._sumN = 0;
 
     /** Fractional-particle carry for emitDust. */
     this._dustAccum = 0;
@@ -252,7 +250,6 @@ export class ParticleSystem {
     const P = TUNING.particles;
     const L = additive ? this._add : this._alpha;
 
-    this._fx = x; this._fy = y; this._fz = z;
 
     // normalise the bias direction once
     let bx = dirX || 0, by = dirY || 0, bz = dirZ || 0;
@@ -316,7 +313,6 @@ export class ParticleSystem {
     this._dustAccum -= n;
     if (n > 24) n = 24; // one frame can never blow the whole budget on dust
 
-    this._fx = x; this._fy = y; this._fz = z;
 
     unpackColor(color);
 
@@ -355,7 +351,6 @@ export class ParticleSystem {
     const P = TUNING.particles;
     const L = this._add;
 
-    this._fx = x; this._fy = y; this._fz = z;
 
     let bx = dirX || 0, by = dirY || 0, bz = dirZ || 0;
     const bl = Math.sqrt(bx * bx + by * by + bz * bz);
@@ -407,7 +402,6 @@ export class ParticleSystem {
     const P = TUNING.particles;
     const L = this._add;
 
-    this._fx = x; this._fy = y; this._fz = z;
 
     const life = P.flashLife > 0.01 ? P.flashLife : 0.01;
     const s = clamp(size > 0 ? size : P.flashSize, 0.01, P.maxSizeWorld);
@@ -434,53 +428,36 @@ export class ParticleSystem {
     if (!(dt > 0)) dt = 0;
 
     this._buildBasis(cam);
-
-    this._sumX = 0; this._sumY = 0; this._sumZ = 0; this._sumN = 0;
-
     this._updateLayer(this._add, dt, true);
     this._updateLayer(this._alpha, dt, false);
-
-    if (this._sumN > 0) {
-      const inv = 1 / this._sumN;
-      this._fx = this._sumX * inv;
-      this._fy = this._sumY * inv;
-      this._fz = this._sumZ * inv;
-    }
   }
 
-  /** Camera-facing basis, computed once per frame. @private */
+  /**
+   * View-plane billboard basis, taken straight from the camera's world matrix.
+   *
+   * Aiming every quad at a single focus point instead (the live-particle
+   * centroid, say) foreshortens anything away from that point — up to ~18 % squash
+   * at the widest FOV — and makes the whole field swim whenever the focus moves.
+   * Right and up out of the view matrix are both exact and cheaper.
+   */
   _buildBasis(cam) {
-    // fallback: looking down the hill and slightly downward (pre-normalised)
-    let fx = 0;
-    let fy = -0.32880;
-    let fz = -0.94438;
-    if (cam) {
-      const dx = this._fx - cam.x;
-      const dy = this._fy - cam.y;
-      const dz = this._fz - cam.z;
-      const l = Math.sqrt(dx * dx + dy * dy + dz * dz);
-      if (l > 1e-4) {
-        const inv = 1 / l;
-        fx = dx * inv; fy = dy * inv; fz = dz * inv;
-      }
+    let rx = 1, ry = 0, rz = 0;
+    let upx = 0, upy = 1, upz = 0;
+    const m = cam && cam.matrixWorld ? cam.matrixWorld.elements : null;
+    if (m) {
+      rx = m[0]; ry = m[1]; rz = m[2];
+      upx = m[4]; upy = m[5]; upz = m[6];
+      const rl = Math.sqrt(rx * rx + ry * ry + rz * rz);
+      if (rl > 1e-6) { const inv = 1 / rl; rx *= inv; ry *= inv; rz *= inv; }
+      const ul = Math.sqrt(upx * upx + upy * upy + upz * upz);
+      if (ul > 1e-6) { const inv = 1 / ul; upx *= inv; upy *= inv; upz *= inv; }
     }
-    // forward points camera -> focus; the quad normal points back at the camera
-    let rx = -fz;
-    let ry = 0;
-    let rz = fx;
-    const rl = Math.sqrt(rx * rx + rz * rz);
-    if (rl < 1e-4) { rx = 1; ry = 0; rz = 0; } else {
-      const inv = 1 / rl;
-      rx *= inv; rz *= inv;
-    }
-    // up = cross(right, forward)
-    const upx = ry * fz - rz * fy;
-    const upy = rz * fx - rx * fz;
-    const upz = rx * fy - ry * fx;
-
     this._rx = rx; this._ry = ry; this._rz = rz;
     this._upx = upx; this._upy = upy; this._upz = upz;
-    this._nx = -fx; this._ny = -fy; this._nz = -fz;
+    // normal = right x up, i.e. straight back at the camera
+    this._nx = ry * upz - rz * upy;
+    this._ny = rz * upx - rx * upz;
+    this._nz = rx * upy - ry * upx;
   }
 
   /**
@@ -534,7 +511,6 @@ export class ParticleSystem {
       const z = L.pz[idx] + vz * dt;
       L.px[idx] = x; L.py[idx] = y; L.pz[idx] = z;
 
-      this._sumX += x; this._sumY += y; this._sumZ += z; this._sumN++;
 
       // ── fade + size curves
       let fade = Math.pow(t, L.fadePow[idx]);
@@ -624,7 +600,6 @@ export class ParticleSystem {
     this._add.pool.releaseAll();
     this._alpha.pool.releaseAll();
     this._dustAccum = 0;
-    this._fx = 0; this._fy = 0; this._fz = 0;
     this._add.mesh.count = 0;
     this._add.mesh.visible = false;
     this._add.prevCount = 0;
