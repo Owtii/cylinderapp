@@ -7,16 +7,31 @@ export const BLOCKER = 'BLOCKER';
  * Roller-vs-box overlap.
  *
  * The roller is treated as a box: ±halfWidth on x (its axis), ±radius on y and z.
- * The padding is NEGATIVE on purpose — props are drawn from a few primitives and
- * their AABB over-covers the real silhouette, so an exact test punishes near-misses
- * that visually cleared. This game rewards precision (see the near-miss boost), so
- * the contact test has to agree with what the player saw.
+ *
+ * The padding differs per axis, because two of v3's requirements pull opposite ways
+ * and both are right:
+ *
+ *   LATERAL (x) is NEGATIVE. Props are drawn from a few primitives and their AABB
+ *   over-covers the real silhouette, so an exact test punishes near-misses that
+ *   visually cleared. This game rewards precision (see the near-miss boost), so the
+ *   contact test has to agree with what the player saw.
+ *
+ *   APPROACH (z) is POSITIVE. §5: "Objects break before they visually touch you.
+ *   Trigger destruction ~0.15 units early. A frame of visible interpenetration reads
+ *   as collision; breaking early reads as disintegration." That is a statement about
+ *   the axis you arrive along, not about the one you steer along.
+ *
+ * `approachPad` lets the caller opt out of the early break. Blockers pass 0: dying
+ * 0.15 m before you touched the pillar would read as a cheat, and a blocker is the
+ * one contact in the game that must feel exact.
  */
-export function overlaps(px, py, pz, phw, pr, ox, oy, oz, oex, oey, oez) {
-  const pad = TUNING.collision.contactPadding;
-  if (Math.abs(px - ox) > phw + oex + pad) return false;
-  if (Math.abs(pz - oz) > pr + oez + pad) return false;
-  if (Math.abs(py - oy) > pr + oey + pad) return false;
+export function overlaps(px, py, pz, phw, pr, ox, oy, oz, oex, oey, oez, approachPad) {
+  const C = TUNING.collision;
+  const lat = C.contactPadLateral;
+  const ahead = approachPad === undefined ? C.contactPadApproach : approachPad;
+  if (Math.abs(px - ox) > phw + oex + lat) return false;
+  if (Math.abs(pz - oz) > pr + oez + ahead) return false;
+  if (Math.abs(py - oy) > pr + oey + lat) return false;
   return true;
 }
 

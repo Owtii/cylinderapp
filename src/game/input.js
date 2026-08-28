@@ -25,6 +25,7 @@ export class Input {
     this.tuckEdge = false;
     this.restartEdge = false;
     this.pauseEdge = false;
+    this.debugEdge = false;
     this.anyEdge = false;
 
     this.pointerId = -1;
@@ -56,6 +57,7 @@ export class Input {
     this.tuckEdge = false;
     this.restartEdge = false;
     this.pauseEdge = false;
+    this.debugEdge = false;
     this.anyEdge = false;
   }
 
@@ -85,6 +87,9 @@ export class Input {
         break;
       case 'KeyR': this.restartEdge = true; break;
       case 'Escape': case 'KeyP': this.pauseEdge = true; break;
+      // The §14 acceptance counters. Two bindings because F3 is the convention and
+      // backquote is the one that survives a laptop with media keys on the F-row.
+      case 'Backquote': case 'F3': this.debugEdge = true; e.preventDefault(); break;
       default: break;
     }
     this.anyEdge = true;

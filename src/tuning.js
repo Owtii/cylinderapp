@@ -16,6 +16,14 @@ export const TUNING = {
     gravity: -30,
     fixedStep: 1 / 60,
     maxStepsPerFrame: 5,
+    // §6.1: "The highway never levels out and never climbs." v2 put a FLAT crest
+    // (grade 0) between every zone for the preview beat — 302 m of the track. v3
+    // replaces those with a steepening pitch-over, and the grade is now bounded on
+    // BOTH sides: an acceptance criterion checks no segment is ever <= 0.
+    minSlopeDeg: 8,
+    maxSlopeDeg: 22,
+    pitchOverDeg: 20,             // the brief preview surge at a zone boundary
+    pitchOverSeconds: 1.6,        // long enough to read the zone below, short enough to feel
     baseSlopeDeg: 11,
     steepSlopeDeg: 17,
     finaleSlopeDeg: 21,           // the run-up steepens into the house
@@ -69,7 +77,11 @@ export const TUNING = {
     blockedSpeedRetain: 0.05,
     blockedRebound: 8.0,
     blockedLockout: 0.30,         // s of no-steer after a block
-    contactPadding: -0.12,        // negative: near-misses stay near-misses
+    // Per-axis, because §5 wants the early break and the near-miss reward wants the
+    // late one, and they are about different axes. See collisions.js.
+    contactPadLateral: -0.12,     // negative: near-misses stay near-misses
+    contactPadApproach: 0.15,     // positive: it disintegrates before it touches you
+    contactPadding: -0.12,        // retained: read by the headless balance harnesses
     hitCooldown: 0.7,             // s before the same object can hit again
     maxStrikes: 3,
   },
@@ -123,7 +135,14 @@ export const TUNING = {
     landmarkShare: 0.62,          // fraction of a zone's budget held by landmarks
     landmarkMaxRatio: 0.78,       // no landmark exceeds this x the ideal arrival weight
 
-    centreRatio: 0.95,
+    // §17's highway content is not decoration — it is absorbable weight, and it is
+  // what makes the §16 medal ladder reachable without touching a single number in
+  // §7's zone table. Split three ways so no one subsystem can quietly eat it all.
+  highwayBudget: 35000,
+  highwayFurnitureBudget: 8000,   // cones, bollards, signs — 20-80 kg each, pure texture
+  highwayTrafficBudget: 20000,    // moving vehicles
+  highwaySetPieceBudget: 7000,    // the six set pieces
+  centreRatio: 0.95,
     // The generator rebuilds a track until a perfect pass could clear the house by
     // this margin. Without it, roughly one seed in twelve was unwinnable.
     winHeadroom: 1.12,
@@ -147,11 +166,13 @@ export const TUNING = {
   // perfect run absorbs 140,500 kg — 1.405x the house — so gold at 1.5 could not
   // be reached by any player. Silver and gold are pulled under that ceiling so
   // both are winnable, with gold demanding ~94 % of the whole track.
-  medals: {
-    bronze: 1.0,
-    silver: 1.15,
-    gold: 1.32,
-  },
+  // §16.2. Bronze is beating the house, silver 1.25x, gold 1.5x — the spec's
+  // ratios, restored. In v2 these were unreachable: gold needs 150,000 kg and the
+  // six zones only hold 140,000. v3's §17 highway content (furniture, traffic,
+  // set pieces, tankers) carries `weights.highwayBudget` of real absorbable weight
+  // ON TOP of the zone budgets, giving a 175,500 kg track where the three medals
+  // land at 57 % / 71 % / 85 % of it — gold just under the measured DP ceiling.
+  medals: { bronze: 1.0, silver: 1.25, gold: 1.5 },
 
   // ────────────────────────────────────────────────────── readability (§6, §6.1)
   read: {
@@ -272,6 +293,10 @@ export const TUNING = {
     fovMax: 76,
     fovKickAmount: 4,
     fovKickTime: 0.12,
+    // §5's paper punch. Deliberately small and deliberately brief: it fires on ~80 %
+    // of all contacts, so anything bigger reads as a camera that will not sit still.
+    fovPunchAmount: 2,
+    fovPunchTime: 0.06,
     near: 0.3,
     far: 1200,
   },

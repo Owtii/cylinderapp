@@ -1,6 +1,6 @@
 import * as THREE from 'three/webgpu';
 import { TUNING, weightRatio, classify, CLEAN, PLOW, BLOCKED } from '../tuning.js';
-import { clamp, clamp01, lerp } from '../core/math.js';
+import { clamp, clamp01, lerp, DEG } from '../core/math.js';
 import { GameLoop } from '../core/loop.js';
 import { fxRng } from '../core/rng.js';
 
@@ -24,6 +24,7 @@ import {
 import { TrackProfile } from '../world/track.js';
 import { buildTrackPlan, speedAtWeight } from '../world/trackplan.js';
 import { WorldStream } from '../world/generator.js';
+import { DebugOverlay } from './debug.js';
 import { MATERIALS, PROPS } from '../world/objects.js';
 
 import { ParticleSystem } from '../fx/particles.js';
@@ -43,6 +44,12 @@ const PAUSED = 'paused';
 const OVER = 'over';
 
 /** Reused audio state — allocating this per frame would be 60 objects a second. */
+/** Reused debug counters — same reason as AS below. */
+const DBG = {
+  visible: 0, near: 0, labels: 0, fragments: 0,
+  gradeDeg: 0, weight: 0, speed: 0, zone: 0,
+};
+
 const AS = {
   speed: 0, speed01: 0, weight: 0, grounded: true,
   airborne: false, timeScale: 1, playing: false, chain: 0, zone: 0,
@@ -60,6 +67,7 @@ export class Game {
     this.input = new Input(container);
     this.hud = new Hud(hudRoot);
     this.labels = new LabelSystem(hudRoot);
+    this.debug = new DebugOverlay(hudRoot);
     this.screens = new Screens(screensRoot, {
       onStart: () => this.startRun(),
       onRestart: () => this.restart(),
@@ -144,6 +152,7 @@ export class Game {
     this.fragments.reset();
     this.outlines.reset();
     this.labels.reset();
+    this.debug.reset();
     this.score.reset();
     this.hud.reset();
     this.hud.setWeight(this.player.weight);
@@ -262,6 +271,22 @@ export class Game {
     return best;
   }
 
+  /**
+   * Interactive objects inside the near band — the §6.1 budget that actually bites.
+   * Measured in TIME, not metres, so it means the same thing at 12 m/s and at 46.
+   */
+  _nearBandCount(p) {
+    const reach = Math.max(20, p.speed * TUNING.read.nearBandSeconds);
+    let n = 0;
+    for (let i = 0; i < this.stream.liveCount; i++) {
+      const e = this.stream.live[i];
+      if (!e.alive) continue;
+      const ahead = e.d - p.d;
+      if (ahead >= 0 && ahead <= reach) n++;
+    }
+    return n;
+  }
+
   _applyVolume(kind, v) {
     const s = this.screens.getSettings();
     audio.setVolumes(kind === 'master' ? v : s.master, kind === 'sfx' ? v : s.sfx, kind === 'music' ? v : s.music);
@@ -328,7 +353,10 @@ export class Game {
       const dz = p.z - e.cz;
       if (dz > 24 || dz < -24) continue;
 
-      if (overlaps(p.x, p.y, p.z, p.halfWidth, p.radius, e.cx, e.cy, e.cz, e.ex, e.ey, e.ez)) {
+      // A blocker contact must be exact — see collisions.js. Everything else breaks
+      // 0.15 m early so it disintegrates rather than interpenetrating for a frame.
+      if (overlaps(p.x, p.y, p.z, p.halfWidth, p.radius, e.cx, e.cy, e.cz, e.ex, e.ey, e.ez,
+        e.blocker ? 0 : undefined)) {
         this._impact(e);
         continue;
       }
@@ -419,8 +447,18 @@ export class Game {
     }
 
     this.chase.addTrauma(isClean ? TUNING.shake.traumaClean : TUNING.shake.traumaPlow, p.weight);
-    this.chase.kickFov(TUNING.camera.fovKickAmount * (isClean ? 1 : 0.6));
-    this.loop.requestHitstop(hitstopFor(e.weight, outcome));
+
+    // §5, and this is the whole feel of the paper tier: hitstop is reserved for PLOW
+    // and BLOCKED. Freezing the frame twenty times in two seconds turns a power
+    // fantasy into a stutter, and at 80 % paper by design that is what would happen.
+    // Paper gets a camera PUNCH instead — a brief FOV nudge that decays instantly and
+    // an edge flash. Reads as force, costs no momentum and no frames.
+    if (isClean) {
+      this.chase.kickFov(TUNING.camera.fovPunchAmount, TUNING.camera.fovPunchTime);
+    } else {
+      this.chase.kickFov(TUNING.camera.fovKickAmount * 0.6);
+      this.loop.requestHitstop(hitstopFor(e.weight, outcome));
+    }
     this.chromatic = Math.max(this.chromatic, isClean ? 0.85 : 0.5);
     this.flash = Math.max(this.flash, (isClean ? 0.28 : 0.14) * (0.5 + 0.5 * crowd));
 
@@ -553,6 +591,15 @@ export class Game {
 
     const total = this.plan ? this.plan.house.d : 1;
     this.hud.setProgress(clamp01(p.d / total), this.plan ? this.plan.zones : null, this.stream.zoneIndex);
+    if (this.input.debugEdge) this.debug.toggle();
+    DBG.visible = this.stream.liveCount;
+    DBG.near = this._nearBandCount(p);
+    DBG.labels = this.labels.activeCount ?? 0;
+    DBG.fragments = this.fragments.activeCount ?? 0;
+    DBG.gradeDeg = this.profile.slopeAt(p.d) / DEG;
+    DBG.weight = p.weight; DBG.speed = p.speed; DBG.zone = this.stream.zoneIndex;
+    this.debug.update(rawDt, DBG);
+
     this.hud.update(rawDt);
     this.hud.updatePopups(rawDt, cam, this.renderer.width, this.renderer.height);
     this.labels.update(rawDt, this.stream.live, this.stream.liveCount, p.weight,
@@ -583,6 +630,7 @@ export class Game {
     this.fragments.dispose();
     this.outlines.dispose();
     this.labels.dispose();
+    this.debug.dispose();
     this.house.dispose();
     this.decor.dispose();
     this.props.dispose();

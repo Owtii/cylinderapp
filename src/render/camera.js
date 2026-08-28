@@ -63,9 +63,15 @@ export class ChaseCamera {
     this.trauma = Math.min(TUNING.shake.maxTrauma, this.trauma + amount * scale);
   }
 
-  kickFov(amount) {
+  /**
+   * @param amount degrees of FOV to add
+   * @param time   seconds it holds before decaying. The paper tier passes a very
+   *               short one (§5): the punch has to read as force and be gone before
+   *               the next object arrives, because at 80 % paper they arrive fast.
+   */
+  kickFov(amount, time) {
     this.fovKick = Math.max(this.fovKick, amount ?? TUNING.camera.fovKickAmount);
-    this.fovKickTimer = TUNING.camera.fovKickTime;
+    this.fovKickTimer = Math.max(this.fovKickTimer, time ?? TUNING.camera.fovKickTime);
   }
 
   /**
