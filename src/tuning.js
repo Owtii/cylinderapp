@@ -443,8 +443,12 @@ export const TUNING = {
   },
 
   particles: {
-    maxAlpha: 420,
-    maxAdditive: 420,
+    // §10 fires FOUR layers per impact (burst, dust, material shower, lingering
+    // trace) where v2 fired one, so a busy frame now wants roughly twice the pool.
+    // Undersized, the layers evict each other and the shower — the layer carrying
+    // the material's identity — is the one that loses, because it spawns last.
+    maxAlpha: 800,
+    maxAdditive: 640,
     dustRateBase: 24,
     dustRateSpeed: 3.0,
     // Dust is scaled by the DRUM, not by a constant. At the start of a run the

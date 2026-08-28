@@ -29,6 +29,9 @@ import { MATERIALS, PROPS } from '../world/objects.js';
 
 import { ParticleSystem } from '../fx/particles.js';
 import { FragmentSystem } from '../fx/fragments.js';
+import { SquashSystem } from '../fx/squash.js';
+import { DecalSystem } from '../fx/decals.js';
+import { materialIndex } from '../fx/fracture.js';
 
 import { Score } from './score.js';
 import { Input } from './input.js';
@@ -46,7 +49,7 @@ const OVER = 'over';
 /** Reused audio state — allocating this per frame would be 60 objects a second. */
 /** Reused debug counters — same reason as AS below. */
 const DBG = {
-  visible: 0, near: 0, labels: 0, fragments: 0,
+  visible: 0, near: 0, labels: 0, fragments: 0, crush: 0, wrecks: 0, decals: 0,
   gradeDeg: 0, weight: 0, speed: 0, zone: 0,
 };
 
@@ -111,6 +114,8 @@ export class Game {
     this.trail = new Trail(scene);
     this.particles = new ParticleSystem(scene);
     this.fragments = new FragmentSystem(scene, (x, z) => this.stream.groundYAt(x, z));
+    this.squash = new SquashSystem(this.props);
+    this.decals = new DecalSystem(scene);
     this.outlines = new OutlineSystem(scene);
     this.house = new House(scene);
     this.decor = new Decor(scene);
@@ -150,6 +155,8 @@ export class Game {
     this.trail.reset();
     this.particles.reset();
     this.fragments.reset();
+    this.squash.reset();
+    this.decals.reset();
     this.outlines.reset();
     this.labels.reset();
     this.debug.reset();
@@ -396,7 +403,8 @@ export class Game {
       this.chase.addTrauma(TUNING.shake.traumaBlocked, p.weight);
       this.loop.requestHitstop(TUNING.time.hitstopBlocked * 1.6);
       this.damage = 1;
-      this.particles.emitBurst(ix, iy, iz, 14, colour, 8, 0.8, 0.9, false, 1.5, 0, 0.5, 1);
+      this.particles.emitImpact('concrete', ix, iy, iz,
+        ix - p.x, iy - p.y, iz - p.z, 1, 1, 'BLOCKER');
       audio.playImpact('concrete', 'BLOCKED', Infinity, p.weight, pan, 1);
       this.endRun('blocker');
       return;
@@ -413,7 +421,8 @@ export class Game {
       this.loop.requestHitstop(hitstopFor(e.weight, BLOCKED));
       this.damage = 1;
       this.chromatic = Math.max(this.chromatic, 0.5);
-      this.particles.emitBurst(ix, iy, iz, TUNING.particles.burstBlocked, colour, 7, 0.7, 0.8, false, 1.4, 0, 0.5, 1);
+      this.particles.emitImpact(def.sound || matKey, ix, iy, iz,
+        ix - p.x, iy - p.y, iz - p.z, 0.7, 1, 'BLOCKED');
       audio.playImpact(def.sound || 'concrete', 'BLOCKED', e.weight, p.weight, pan, 1);
       if (audio.playStrike) audio.playStrike(p.strikes);
       audio.duck(TUNING.audio.duckAmountDb, TUNING.audio.duckHold);
@@ -426,25 +435,32 @@ export class Game {
     }
 
     // ── smashed: absorb it
+    //
+    // The prop's render instance changes hands here. Taking the handle BEFORE
+    // consume() hands the instance to the squash instead of hiding it, so the
+    // object can crumple where it stood; consume() only frees a handle it still
+    // holds. If the crush pool is full we fragment on the spot rather than drop
+    // the hit, and free the instance ourselves.
+    const sqKey = e.key;
+    const sqHandle = e.handle;
+    e.handle = -1;
     this.stream.consume(e);
     const isClean = outcome === CLEAN;
     if (!isClean) p.applySpeedLoss(TUNING.collision.plowSpeedLoss);
     p.absorb(e.weight);
 
-    this.fragments.spawn(
-      def, e.x, e.y, e.z, 0, Math.sin(e.rotY * 0.5), 0, Math.cos(e.rotY * 0.5),
-      ix, iy, iz, 0, 0, -p.speed, isClean ? 'PULVERIZE' : 'PLOW',
-    );
-
-    const burst = isClean ? TUNING.particles.burstClean : TUNING.particles.burstPlow;
-    this.particles.emitBurst(ix, iy, iz, Math.round(burst * crowd + 3), colour,
-      isClean ? 13 : 7, 0.85, 1.05, false, 1.7, 0, 0.55, -0.6);
+    // §10's four layers, in one call, with the impact axis pointing the way the
+    // debris should go — away from the roller, which is away from the camera.
+    const nx = ix - p.x, ny = iy - p.y, nz = iz - p.z;
+    const energy01 = clamp01(Math.log(Math.max(1, e.weight) / 40) / Math.log(75000 / 40));
+    this.particles.emitImpact(matKey, ix, iy, iz, nx, ny, nz, energy01, crowd,
+      isClean ? 'PULVERIZE' : 'PLOW');
     if (this.frameImpacts <= TUNING.particles.maxFlashesPerFrame) {
       this.particles.emitFlash(ix, iy, iz, TUNING.particles.flashSize * (isClean ? 1 : 0.6) * (0.55 + 0.45 * crowd), 0xfff4d8);
     }
-    if (matKey === 'metal' || matKey === 'steel' || matKey === 'paint') {
-      this.particles.emitSparks(ix, iy, iz, Math.round(TUNING.particles.sparkCount * crowd), 0, 0.5, -1);
-    }
+    this.decals.addDebris(ix, p.groundY, iz,
+      Math.max(def.size[0], def.size[2]) * 0.5, colour, materialIndex(matKey),
+      this.profile.slopeAt(p.d));
 
     this.chase.addTrauma(isClean ? TUNING.shake.traumaClean : TUNING.shake.traumaPlow, p.weight);
 
@@ -461,6 +477,22 @@ export class Game {
     }
     this.chromatic = Math.max(this.chromatic, isClean ? 0.85 : 0.5);
     this.flash = Math.max(this.flash, (isClean ? 0.28 : 0.14) * (0.5 + 0.5 * crowd));
+
+    // §5 sequencing: everything the player feels has already happened by this line.
+    // The crumple resolves BEHIND them over the next 4-6 frames and nothing waits on
+    // it, so a paper hit still costs exactly zero frames and zero momentum.
+    if (!this.squash.begin(sqKey, sqHandle, e.x, e.y, e.z, e.rotY, e.scale || 1,
+      nx, ny, nz, TUNING.destruction.squashSeconds)) {
+      this.fragments.spawn(
+        def, e.x, e.y, e.z, 0, Math.sin(e.rotY * 0.5), 0, Math.cos(e.rotY * 0.5),
+        ix, iy, iz, 0, 0, -p.speed, isClean ? 'PULVERIZE' : 'PLOW',
+      );
+      if (sqHandle >= 0) this.props.free(sqKey, sqHandle);
+    } else if (!isClean) {
+      // §10: a plowed object survives as wreckage, left permanently crushed on the
+      // road. A trail of ruined vehicles behind you is free spectacle.
+      this.squash.strand(sqKey, sqHandle);
+    }
 
     const chain = this.score.registerSmash(e.weight, outcome, this.loop.simTime);
     this.hud.setWeight(p.weight);
@@ -576,6 +608,30 @@ export class Game {
     const cam = this.renderer.camera;
     this.particles.update(scaledDt, cam);
     this.fragments.update(scaledDt);
+
+    // The crush runs on the scaled clock too, so hitstop freezes an object
+    // mid-crumple and slow-motion stretches it — which is the shot §10 wants.
+    this.squash.update(scaledDt);
+    const done = this.squash.completed;
+    for (let i = 0; i < done.count; i++) {
+      const key = done.key[i];
+      const cdef = PROPS[key];
+      if (!cdef) continue;
+      const cx = done.x[i], cy = done.y[i], cz = done.z[i];
+      const ry = done.rotY[i];
+      this.fragments.spawn(
+        cdef, cx, cy, cz, 0, Math.sin(ry * 0.5), 0, Math.cos(ry * 0.5),
+        cx, cy + cdef.size[1] * 0.5, cz, 0, 0, -p.speed, 'PULVERIZE',
+      );
+    }
+
+    this.decals.update(scaledDt);
+    if (playing && p.grounded) {
+      // Both are internally gated — disturb is a cheap radius test and addTrail
+      // stamps once per 1.4 m — so calling them unconditionally is correct.
+      this.particles.disturb(ix, iz, p.radius * 2.2, 1);
+      this.decals.addTrail(ix, p.groundY, iz, p.halfWidth, this.profile.slopeAt(p.d));
+    }
     this.outlines.update(rawDt, this.stream.live, this.stream.liveCount, p.weight, cam.position);
     this.decor.update(p.d);
     this.house.update(scaledDt, this.houseResolved ? 'hold' : 'idle');
@@ -596,6 +652,9 @@ export class Game {
     DBG.near = this._nearBandCount(p);
     DBG.labels = this.labels.activeCount ?? 0;
     DBG.fragments = this.fragments.activeCount ?? 0;
+    DBG.crush = this.squash.activeCount ?? 0;
+    DBG.wrecks = this.squash.wreckCount ?? 0;
+    DBG.decals = this.decals.activeCount ?? 0;
     DBG.gradeDeg = this.profile.slopeAt(p.d) / DEG;
     DBG.weight = p.weight; DBG.speed = p.speed; DBG.zone = this.stream.zoneIndex;
     this.debug.update(rawDt, DBG);
@@ -627,7 +686,9 @@ export class Game {
     this.trail.dispose();
     this.roller.dispose();
     this.particles.dispose();
+    this.squash.dispose();
     this.fragments.dispose();
+    this.decals.dispose();
     this.outlines.dispose();
     this.labels.dispose();
     this.debug.dispose();

@@ -87,6 +87,8 @@ export class DebugOverlay {
       cap('labels ', s.labels, this.peakLabels, R.maxLabels) +
       floor('grade  ', s.gradeDeg, this.worstGrade, TUNING.world.minSlopeDeg) +
       row('frags  ', `${s.fragments} / ${TUNING.destruction.maxFragments}`) +
+      row('crush  ', `${s.crush}  wrecks ${s.wrecks}`) +
+      row('decals ', `${s.decals} / ${TUNING.decals.max}`) +
       row('fps    ', this.fps.toFixed(0)) +
       row('weight ', `${Math.round(s.weight).toLocaleString('en-US')} kg`) +
       row('speed  ', `${s.speed.toFixed(1)} m/s`) +

@@ -10,8 +10,10 @@
  * the same loop as the matrices), so the vertex stage can push each piece's trailing
  * half backwards along its own velocity and let the silhouette do the work:
  *
- *     smear  = min( speed * exposure, maxStretch ) * gate(speed) * strength   [metres]
- *     tail   = saturate( -dot( normalize( vertex - centre ), velocityDir ) )
+ *     reach  = |vertex - centre|                                            [metres]
+ *     tail   = saturate( -dot( ( vertex - centre ) / reach, velocityDir ) )
+ *     smear  = min( speed * exposure, maxStretch, reach * maxGrowth )
+ *              * gate( speed ) * strength                                   [metres]
  *     vertex = vertex - velocityDir * smear * tail
  *
  * At 45 m/s and an 11 ms exposure that is half a metre of streak on a 0.3 m shard —
@@ -19,6 +21,15 @@
  * velocity-buffer pass would produce the same picture for a handful of instanced
  * meshes at the cost of an extra render target, an extra full-screen pass and a
  * hole in the sharpness of everything the debris flies over.
+ *
+ * THE CLAMP IS RELATIVE AS WELL AS ABSOLUTE, and the relative one is the one that
+ * matters. Half a metre of streak is two thirds of a car door and eight times a
+ * bottle shard: measured over every prop's fracture plan, the absolute clamp alone
+ * left the small glass and the edge-on plates at 6–9x elongation — needles, not
+ * blur — while the median piece sat at a perfectly good 1.3x. Because `reach` is
+ * the piece's own support radius along the smear axis, clamping the offset to
+ * `reach * (maxRatio - 1)` bounds every fragment at `maxRatio` no matter how small
+ * it is, and a plate travelling edge-on (reach ≈ 0) correctly gets nothing at all.
  *
  * Two details are the whole implementation:
  *
@@ -34,12 +45,19 @@
  *     AFTER three has applied the instance matrix, so `positionLocal` is already the
  *     transformed vertex and the piece's middle is the one thing missing. It is read
  *     back the same way three's own instancing reads it — a `mat4` uniform buffer
- *     indexed by `instanceIndex` — which is exact and costs one mat4 fetch. If the
- *     matrices are too many to fit a uniform buffer (three switches to an interleaved
- *     attribute up there, which this node cannot address) the code falls back to the
- *     face-normal form and accepts the seams.
+ *     indexed by `instanceIndex`, with the same uniform-buffer-limit test three
+ *     itself applies — which is exact. It is not free: it binds a SECOND copy of the
+ *     bucket's matrices (16 KB at the shipped cap of 250), re-uploaded each frame
+ *     for each bucket that actually draws. Buckets with no live fragments are hidden
+ *     and cost nothing, so in practice this is two or three extra uploads a frame,
+ *     which is the same order as what three already spends instancing these meshes.
+ *     If the matrices are too many to fit a uniform buffer (three switches to an
+ *     interleaved attribute up there, which this node cannot address) the code falls
+ *     back to the face-normal form, keeps the absolute clamp only, and accepts the
+ *     seams. At a 250-fragment cap that branch is unreachable; it exists so a raised
+ *     cap degrades instead of failing to compile.
  *
- * The stretch is clamped in metres so a fragment thrown by a tanker cannot become an
+ * The stretch is clamped both ways so a fragment thrown by a tanker cannot become an
  * infinite streak, and it is gated by speed so a piece that has gone to sleep is a
  * bit-exact no-op — `fragments.js` writes a zero velocity for a sleeping or fading
  * shard, and a zero velocity multiplies the offset out on its own as well.
@@ -94,6 +112,12 @@ function post() {
   return ( TUNING && TUNING.post ) || {};
 }
 
+/** Elongation ratio → the growth multiplier the shader wants. 1 disables the smear. */
+function growthFrom( ratio ) {
+  const r = num( ratio, 3 );
+  return r > 1 ? r - 1 : 0;
+}
+
 // ──────────────────────────────────────────────────────────────────── uniforms
 //
 // Module scope on purpose: there is exactly one fragment material in the game, and
@@ -101,6 +125,8 @@ function post() {
 
 const uExposure = /*@__PURE__*/ uniform( num( post().fragmentBlurExposure, 0.011 ) );
 const uMaxStretch = /*@__PURE__*/ uniform( num( post().fragmentBlurMax, 1.6 ) );
+/** Growth, not ratio: `maxRatio - 1`, so it multiplies `reach` directly. */
+const uMaxGrowth = /*@__PURE__*/ uniform( growthFrom( post().fragmentBlurMaxRatio ) );
 const uMinSpeed = /*@__PURE__*/ uniform( num( post().fragmentBlurMinSpeed, 5 ) );
 const uFullSpeed = /*@__PURE__*/ uniform( num( post().fragmentBlurFullSpeed, 12 ) );
 const uStrength = /*@__PURE__*/ uniform(
@@ -171,22 +197,28 @@ export function fragmentBlurPositionNode() {
     const speed = length( velocity ).toVar();
     const dir = velocity.div( max( speed, EPS ) ).toVar();
 
+    // `tail` is 1 at the trailing pole and falls to 0 across the whole leading
+    // hemisphere; `reach` is how far this vertex sits from the piece's middle, which
+    // at the pole is the piece's own radius along the smear axis.
+    let tail;
+    let reach = null;
+    if ( centre !== null ) {
+      const rel = positionLocal.sub( centre ).toVar();
+      reach = length( rel ).toVar();
+      tail = saturate( rel.div( max( reach, EPS ) ).dot( dir ).negate() ).toVar();
+    } else {
+      tail = saturate( normalLocal.dot( dir ).negate() ).toVar();
+    }
+
     // Below `fragmentBlurMinSpeed` nothing smears at all, so a shard settling on the
     // road cannot shimmer as it comes to rest.
     const gate = smoothstep( uMinSpeed, uFullSpeed, speed );
-    const smear = min( speed.mul( uExposure ), uMaxStretch )
-      .mul( gate )
-      .mul( uStrength )
-      .toVar();
-
-    // 1 at the trailing pole, falling to 0 across the whole leading hemisphere.
-    let tail;
-    if ( centre !== null ) {
-      const rel = positionLocal.sub( centre ).toVar();
-      tail = saturate( rel.div( max( length( rel ), EPS ) ).dot( dir ).negate() );
-    } else {
-      tail = saturate( normalLocal.dot( dir ).negate() );
-    }
+    let smear = min( speed.mul( uExposure ), uMaxStretch );
+    // Bounds the elongation at `fragmentBlurMaxRatio` for a shard of any size. Still
+    // a pure function of the vertex position, so duplicated vertices on this
+    // non-indexed geometry agree bit-for-bit and the hull stays watertight.
+    if ( reach !== null ) smear = min( smear, reach.mul( uMaxGrowth ) );
+    smear = smear.mul( gate ).mul( uStrength ).toVar();
 
     return positionLocal.sub( dir.mul( smear.mul( tail ) ) );
   } )();
@@ -225,6 +257,8 @@ export function syncFragmentMotionBlur() {
   const maxStretch = num( P.fragmentBlurMax, 1.6 );
   uMaxStretch.value = maxStretch > 0 ? maxStretch : 0;
 
+  uMaxGrowth.value = growthFrom( P.fragmentBlurMaxRatio );
+
   // Strictly ordered, or the shader's smoothstep is a divide by zero.
   const minSpeed = Math.max( 0, num( P.fragmentBlurMinSpeed, 5 ) );
   const fullSpeed = num( P.fragmentBlurFullSpeed, 12 );
@@ -239,17 +273,23 @@ export function syncFragmentMotionBlur() {
 
 /**
  * The smear a fragment at `speed` would get, in metres, under the current tuning.
- * Exists so the numbers in this file can be checked without a GPU.
+ * An exact CPU mirror of the shader's arithmetic — it exists so the numbers in this
+ * file can be measured without a GPU, and so a tuning sweep can be checked against
+ * real fracture plans in Node.
  *
  * @param {number} speed m/s.
+ * @param {number} [reach] the piece's radius along the smear axis, in metres. Omit
+ *   for the absolute clamp alone (which is what the fallback taper applies).
  * @returns {number} metres of stretch beyond the trailing pole.
  */
-export function fragmentBlurStretchFor( speed ) {
+export function fragmentBlurStretchFor( speed, reach ) {
   if ( ! ( speed > 0 ) ) return 0;
   const lo = uMinSpeed.value;
   const hi = uFullSpeed.value;
   let g = ( speed - lo ) / ( hi - lo > 1e-4 ? hi - lo : 1e-4 );
   g = g < 0 ? 0 : g > 1 ? 1 : g;
   g = g * g * ( 3 - 2 * g );   // matches the shader's smoothstep
-  return Math.min( speed * uExposure.value, uMaxStretch.value ) * g * uStrength.value;
+  let s = Math.min( speed * uExposure.value, uMaxStretch.value );
+  if ( reach >= 0 ) s = Math.min( s, reach * uMaxGrowth.value );
+  return s * g * uStrength.value;
 }
