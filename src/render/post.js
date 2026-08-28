@@ -13,6 +13,13 @@
  * Backend safety: no compute, no storage buffers, no WGSL-only nodes. `atan(y,x)`
  * is emitted as `atan2` on WebGPU and `atan(y,x)` on the WebGL2 fallback by three
  * itself, so the whole chain compiles on both backends.
+ *
+ * One effect deliberately does NOT live in this chain: the motion blur on debris
+ * (§10). It is a per-instance vertex stretch inside the fragment material rather
+ * than a screen-space pass, because the world has to stay sharp — see
+ * `render/motionblur.js`. Its uniforms are re-synced from here so that everything
+ * driven by `TUNING.post` is driven from one place, and so a build with
+ * post-processing switched off still gets the tuning it asked for.
  */
 
 import { RenderPipeline, PostProcessing } from 'three/webgpu';
@@ -42,6 +49,24 @@ import { bloom } from 'three/addons/tsl/display/BloomNode.js';
 
 import { TUNING } from '../tuning.js';
 import { clamp01, TAU } from '../core/math.js';
+import {
+  applyFragmentMotionBlur,
+  fragmentBlurIsExact,
+  fragmentBlurPositionNode,
+  fragmentBlurStretchFor,
+  syncFragmentMotionBlur,
+} from './motionblur.js';
+
+// Re-exported so a caller that already imports the post chain does not have to know
+// the blur lives in its own file. `fx/fragments.js` decorates its material with
+// `applyFragmentMotionBlur`; nothing else in the game smears.
+export {
+  applyFragmentMotionBlur,
+  fragmentBlurIsExact,
+  fragmentBlurPositionNode,
+  fragmentBlurStretchFor,
+  syncFragmentMotionBlur,
+};
 
 // ─────────────────────────────────────────────────────────────── palette
 // Pure look constants (not balance numbers) — kept local on purpose.
@@ -347,6 +372,10 @@ export class PostFX {
 
   /** @private Zero-allocation frame body. */
   _draw() {
+    // Outside the enabled branch on purpose: the fragment stretch is part of the
+    // scene, not of this chain, so it keeps its tuning when post is switched off.
+    syncFragmentMotionBlur();
+
     if ( this._enabled === true && this._pipeline !== null ) {
       this._syncTuning();
       this._advanceClock();

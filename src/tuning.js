@@ -344,6 +344,102 @@ export const TUNING = {
     fragmentCastShadow: true,
     impulseFalloff: 1.7,          // impulse falls with distance^-this from the contact
     impulseJitter: 2.4,           // m/s of random scatter on every shard
+
+    // ── delivered by the 'fracture' subsystem ─────────────────────────────────
+    // max fragment pieces baked per prop per variant; 44 fills a glass pane with slivers while a 5-part vehicle still gets every part represented
+    fracturePieceCap: 44,
+    // size multiplier for pieces at the impact point - the 'small near the hit' half of the §10 grading
+    fractureNearScale: 0.55,
+    // size multiplier for pieces at the far side; the 0.55..1.50 spread is renormalised so grading conserves total volume (measured error < 0.9%)
+    fractureFarScale: 1.50,
+    // longest:shortest extent allowed on a piece. Real sheet is 3 mm on a 4 m silo, but a fragment that thin is edge-on invisible and z-fights the road it lands on
+    fractureMaxAspect: 22,
+    // m of skin a sheet-metal object tears off as; a boxy prop shells into face panels this thick rather than fracturing solid
+    fracturePanelThickness: 0.09,
+    // fraction of a concrete/sand break-up that is fines rather than blocks - rubble without dust reads as a Lego set coming apart
+    fractureChunkDust: 0.30,
+    // minimum length:width of a wood splinter; the generator drops cross-section cuts until it holds, which is what stops wood breaking into cubes
+    fractureSplinterAspect: 2.6,
+    // how far a torn metal panel stays bent, degrees. A panel that lands perfectly flat is the tell that it was a box
+    fractureBendDeg: 16,
+    // irregularity of concrete split planes as a fraction of cell size; 0 gives a visible grid, which is the single fastest way to make fracture look fake
+    fractureJitter: 0.35,
+    // a thin peripheral part smaller than this share of the object is trim that comes off whole (door, bumper, mirror, sign). Glass gets 2.5x this, because a bus windscreen band really is a fifth of the bus
+    fractureDetachVolumeFrac: 0.12,
+    // max pieces per plan flagged detach. 'A part came off' is a read, and a read does not survive fourteen simultaneous copies of itself
+    fractureMaxDetach: 6,
+
+    // ── delivered by the 'fragments' subsystem ─────────────────────────────────
+    // §10: fragments carry at least this multiple of the player's velocity along their heading — below 1.0 debris travels WITH the roller and lands on the next formation.
+    inheritVelMin: 1.1,
+    // §10: top of the inherited-velocity range; above ~1.5 debris outruns the camera and vanishes before it reads as an explosion.
+    inheritVelMax: 1.4,
+    // §10: upward kick as a fraction of a fragment's horizontal speed. Fraction, not a constant, so a 40 m/s smash lifts more than a 20 m/s one.
+    upBiasFracMin: 0.15,
+    upBiasFracMax: 0.25,          // §10: top of the upward-bias band; measured mean lands at 0.201.
+    // §10: minimum angular velocity in rad/s. Never zero — a fragment that does not tumble reads as a static prop that teleported.
+    spinMin: 3.0,
+    // §10: maximum angular velocity in rad/s; above this small shards strobe against the frame rate.
+    spinMax: 12.0,
+    // §10's ±25 % on every impulse term (radial push, inheritance, up bias, spin) so no two pieces of one object move alike.
+    impulseVariance: 0.25,
+    // Extra throw for pieces the fracture plan flags detachable (wheels, doors, mirrors) so they read as parts coming off, not as more debris.
+    detachImpulseScale: 1.35,
+    // Extra spin on detachables for the same reason — a wheel that tumbles hard is the single most legible piece of a car break-up.
+    detachSpinScale: 1.5,
+    // §10: metres from BOTH camera and roller beyond which a spawn is visual-only. Both, because the chase camera sits 9–42 m back depending on roller radius.
+    fragmentPhysicsRange: 25,
+    // Seconds of arc a visual-only fragment gets before fading. Short because it never queries the ground, so a longer life would visibly sink through the road.
+    fragmentVisualLifePhysics: 0.7,
+    // Headroom for the preallocated fracture plan. FRACTURE_MAX_PIECES is 44 today; the max of the two is used so a rebake with denser plans is not truncated.
+    fracturePlanCapacity: 64,
+    // How many big PLOW pieces may collide with each other at once. Bounds the only O(n²) loop in the system at ~276 distance checks.
+    bigCollisionMax: 24,
+    // Bounce between two big fragments. Deliberately dead — this exists so large pieces do not interpenetrate, not so they ping off each other.
+    bigCollisionRestitution: 0.35,
+    // §17: seconds after spawn during which a fragment can destroy a paper-tier object it hits. Matches the contract exactly.
+    secondaryWindow: 0.6,
+    // §17: the fragment's bounding radius is scaled by this for the kill probe, so a fast shard does not tunnel past a thin object between frames.
+    secondaryRadiusScale: 1.6,
+    // §17: seconds between world probes per fragment (phase-offset at spawn so the cost spreads across frames rather than spiking on one).
+    secondaryProbePeriod: 0.05,
+    // §17: cap on secondary kills per frame. Keeps a lucky shotgun of debris from clearing a whole formation in one frame and blowing the weight budget.
+    secondaryMaxKillsPerFrame: 3,
+    // §17: m/s below which a fragment stops being able to kill. A shard rolling to a stop must not vacuum up objects it is resting against.
+    secondaryMinSpeed: 6,
+
+    // ── delivered by the 'squash' subsystem ─────────────────────────────────
+    // default crush duration when the caller passes 0 - the middle of §10's 60-90 ms window, 5 drawn frames at 60 fps
+    squashSeconds: 0.075,
+    // shortest crush; below this the crumple is under 4 frames and reads as a pop rather than a crush
+    squashSecondsMin: 0.060,
+    // longest crush; above this it is more than 6 frames and starts to read as an animation the player is waiting for
+    squashSecondsMax: 0.090,
+    // peak compression along the impact axis at the far end; measured extent compression lands in [this, this*(1+squashNearBias)] = 33.4-43.5%, inside §10's 30-45% for every prop and every axis
+    squashCompression: 0.335,
+    // parts at the contact crush 30% harder than parts at the far end - this is what makes it a crumple instead of a scale. Raising it past 0.34 pushes the measured compression above 45%
+    squashNearBias: 0.30,
+    // fraction of the timeline by which the far end lags the contact, so the fold propagates through the object. At 0.18 the far end still moves on the first frame at all three durations; at 0.35 it sat still for a frame on tall props
+    squashStagger: 0.18,
+    // crush easing, 1-(1-t)^p. A harder ease-out spends its last two frames moving fractions of a centimetre and fails the every-frame-looks-different test
+    squashEasePower: 1.25,
+    // how far the body settles onto the road, as a fraction of each part's height - the roof goes first, the chassis barely moves
+    squashSink: 0.22,
+    // outward bulge of the volume the crush removes, orthogonal to the impact axis so it cannot fight the compression
+    squashSplay: 0.14,
+    // rad of roll about the impact axis at full crush, so the crush reads as metal buckling rather than a deflating balloon. Rolling about the impact axis is the one rotation that cannot change the axial extent
+    squashRoll: 0.16,
+    // rad of pitch at full crush, for asymmetry. Small on purpose: pitch mixes a part's height into its axial support, and a tall prop at 0.10 rad gave back 10% of its extent
+    squashPitch: 0.03,
+    // hard ceiling on any single part's compression - past this a part folds through itself
+    squashMaxPartCrush: 0.80,
+    // concurrent crushes; a busy frame in this game is ~6 smashes, so 24 covers four of them before begin() starts refusing and the caller fragments immediately instead
+    squashPool: 24,
+    // permanent PLOW wrecks kept on the road, oldest evicted first. 40 against gfx.instanceCapPerProp 160 leaves plenty of instances for live props
+    squashStrandMax: 40,
+    // a wreck settles deeper than the crush ended - a car that has been driven over lies flatter than one caught mid-crumple
+    squashStrandCompression: 0.50,
+
   },
 
   particles: {
@@ -410,6 +506,102 @@ export const TUNING = {
     flashGrow: 1.9,
     flashHaloScale: 2.1,
     flashHaloGain: 0.45,
+
+    // ── delivered by the 'particles' subsystem ─────────────────────────────────
+    // per-impact particle spend by outcome — a bounce sprays a fraction of what a pulverise does
+    impactOutcomeScale: { PULVERIZE: 1, CLEAN: 1, PLOW: 0.75, BLOCKED: 0.45, BLOCKER: 0.5 },
+    // floor on the crowd multiplier, so a smash in a twelve-object formation still fires all four layers
+    impactCrowdFloor: 0.30,
+    // internal per-frame crowd decay, 1/(1+n*this) — the backstop when a caller forgets crowd01
+    impactCrowdFalloff: 0.16,
+    // slots ONE impact may steal from a fully saturated layer; RingPool's steal is a linear scan, so this caps the pathological cost at ~3 us
+    impactMinPerLayer: 3,
+    // amplifies every impact particle's lateral velocity so debris leaves frame sideways instead of sitting centre-screen (§6.1)
+    impactLateralBias: 0.55,
+    // m/s of +Z velocity any impact particle may carry; the hard backstop on 'debris never travels toward the camera', matching destruction.maxTowardCamera
+    maxTowardCamera: 0,
+    impactBurstCount: [40, 80],   // layer 1 count, lerped by energy01 — §10's 40-80 specks
+    impactBurstLife: 0.30,        // layer 1 lifetime in seconds, per §10
+    // m/s of layer-1 throw by energy; fast enough to clear the roller in a frame
+    impactBurstSpeed: [9, 26],
+    // m; specks, not puffs — a burst reads as the object coming apart
+    impactBurstSize: [0.10, 0.34],
+    // 0 = tight along the impact axis, 1 = full sphere; wide, because a pulverise has no direction
+    impactBurstSpread: 0.75,
+    // m/s subtracted from every layer-1 particle's Z, biasing the spray downhill and away from the viewer
+    impactBurstAway: 3.0,
+    // extra lateral amplification on layer 1 only, on top of impactLateralBias
+    impactBurstLateral: 0.35,
+    impactDustCount: [10, 22],    // layer 2 count; few and large is what gives an impact its size
+    impactDustLife: 2.0,          // layer 2 lifetime in seconds, per §10
+    // m/s; slow, so the puff stays where the object was and the roller outruns it
+    impactDustSpeed: [1.4, 4.5],
+    // m of puff radius by energy — a mailbox and a water tower must not make the same cloud
+    impactDustSize: [0.70, 2.80],
+    // the puff nearly triples over its life; expansion is what makes it read as volume
+    impactDustGrow: 2.4,
+    // drag on layer 2, so it stalls into a hanging cloud rather than dispersing
+    impactDustDrag: 1.9,
+    // m/s of downhill bias; small, so the cloud is nearly stationary in world space and drifts backward relative to the player
+    impactDustAway: 0.8,
+    impactDustRise: 0.9,          // m/s of buoyancy on layer 2
+    // layer 3 budget, split between the sub-emitters by material family
+    impactShowerCount: [12, 34],
+    impactShowerSpeed: [10, 22],  // m/s base for every shower sub-emitter, scaled per family
+    // tighter than the burst — a shower has a direction, that is what makes it a signature
+    impactShowerSpread: 0.55,
+    impactShowerAway: 2.0,        // m/s downhill bias on layer 3
+    impactTraceCount: [3, 7],     // layer 4 count; a handful of big soft quads, not a fog bank
+    // layer 4 lifetime in seconds, per §10 — the smoke you drive back through
+    impactTraceLife: 3.0,
+    // m; the largest quads in the system, which is why they are also the dimmest
+    impactTraceSize: [1.1, 3.2],
+    impactTraceSpeed: 0.55,       // m/s; barely moving, it is meant to hang
+    impactTraceGrow: 1.6,         // slow spread over the 3 s
+    impactTraceDrag: 2.2,         // high drag so a disturbed trace settles again instead of scattering
+    impactTraceRise: 0.35,        // m/s of buoyancy on layer 4
+    impactTraceAway: 0.25,        // m/s downhill bias; almost none, the trace is supposed to stay put
+    // layer 4 is deliberately faint — it must never compete with the next formation for attention
+    impactTraceBright: 0.55,
+    // m/s the roller shoves lingering trace outward at strength 1; enough to punch a visible hole
+    disturbSpeed: 6.0,
+    disturbRise: 0.35,            // upward component of the same shove, per unit of outward push
+    // glass shower: cold near-white, chroma 0.078 (§6.1 — a glint is light, not colour)
+    glintColor: 0xd8e6ec,
+    glintLife: [0.25, 0.70],      // s; short, so glints read as flashes rather than as floating dots
+    glintSize: 0.16,              // m; tiny additive billboards
+    glintSpin: 22,                // rad/s — the hard tumble is what makes a shard read as catching the light
+    splinterLife: [0.35, 0.85],   // s for wood splinters
+    splinterSize: 0.16,           // m before the velocity stretch is applied
+    // velocity-aligned stretch; §10 says wood is long splinters along the grain, never cubes
+    splinterStretch: 4.5,
+    // desaturated sand, chroma 0.184 at hue 41 — well under anything that would read as amber
+    sawdustColor: 0xc7b898,
+    sawdustLife: [0.55, 1.20],    // s; outlives the splinters, which is what sells 'wood'
+    sawdustSize: 0.45,            // m of sawdust haze
+    // incandescent white-hot; §6.1 forbids reusing the existing amber sparkColorHot for the new shower
+    showerSparkHot: 0xfff6e8,
+    // the cold blue-white bleed §6.1 asks for, so sparks have variation without touching amber
+    showerSparkCool: 0xbcd4ff,
+    // desaturated blue-grey; the chips that come off a struck panel with the sparks
+    paintChipColor: 0x99a1a8,
+    chipLife: [0.40, 0.95],       // s; chips outlast sparks, so a metal hit has a second beat
+    chipSize: 0.13,               // m
+    gritColor: 0xa8a8a2,          // concrete grit, chroma 0.024 — effectively neutral
+    gritLife: [0.35, 0.80],       // s
+    gritSize: 0.15,               // m
+    // matches MATERIALS.concrete.particle so the dust and the object agree
+    concreteDustColor: 0xb0b0aa,
+    concreteDustLife: [0.90, 1.80],// s; long, because §10 makes concrete the dustiest material
+    concreteDustSize: 0.85,       // m of fine dust
+    shellLife: [0.45, 1.00],      // s for plastic/rubber shells
+    // m; §10 says plastic is a few LARGE curved shells, so this is the biggest shower particle
+    shellSize: 0.34,
+    fluidColor: 0x5a666e,         // dark blue-grey fluid spray, vehicles only, chroma 0.078
+    fluidLife: [0.30, 0.70],      // s
+    fluidSize: 0.18,              // m before stretch
+    fluidStretch: 3.0,            // velocity-aligned; fluid reads as streaks, not droplets
+
   },
 
   // ─────────────────────────────────────────────────────────────────── scoring
@@ -571,6 +763,50 @@ export const TUNING = {
     windSmoothing: 0.05,
     blockerHumGain: 0.15,         // the warning hum inside read.blockerHumRadius
     blockerHumHz: 46,
+  },
+
+  // ─────────────────────────────────────── ground decals (src/fx/decals.js)
+  //
+  // §10's aftermath: scattered debris under every destruction, the roller's crush
+  // trail, and glass glitter that catches the light. Decals persist for the run,
+  // so the cap and the oldest-first eviction are what keep them from unbounded.
+  decals: {
+    // ── delivered by the 'particles' subsystem ─────────────────────────────────
+    // hard cap on ground decals; the ring overwrites the oldest, which by then is hundreds of metres behind the camera
+    max: 700,
+    renderOrder: 2,               // above the road (0) and the scorch strip (1), below the particle layers (12)
+    // m along the ramp normal, to beat z-fighting with the road (matches read.outlineRingLift's reasoning)
+    lift: 0.030,
+    // extra lift for the crush trail and glass glints, so they sit over the debris blotches
+    hardLift: 0.012,
+    popIn: 0.14,                  // s of fade-in; nothing is ever stamped onto the road at full strength
+    maxSize: 6.0,                 // m cap on any decal quad, so a huge landmark cannot paint a car-park
+    debrisScatter: [3, 6],        // quads per addDebris call — a patch of ground, not one blotch
+    debrisSpread: 1.15,           // scatter radius as a multiple of the object's footprint
+    debrisRadiusScale: [0.35, 0.95],// blotch size as a fraction of the footprint
+    debrisAlpha: 0.42,            // opacity; a stain, not a sticker
+    // multiplier on the material tint — a mark on tarmac is darker than the dust that made it
+    debrisDarken: 0.55,
+    // neutral grey for a caller that passes no colour; matches fragments.js's FALLBACK_MATERIAL
+    debrisFallbackColor: 0x8b9096,
+    glitterCount: [4, 9],         // glints per glass destruction
+    glitterSpread: 1.4,           // glints throw slightly wider than the debris blotches
+    glitterSize: [0.10, 0.24],    // m; the smallest decals in the game
+    glitterAlpha: 0.75,           // bright — a glint has to survive against a lit road
+    glitterColor: 0xe8f2f7,       // near-white with the faintest cold cast, chroma 0.059
+    // s of twinkle before a glint settles; bounds the per-frame animated set so update() goes quiet
+    glitterTwinkle: 6.0,
+    // twinkle rate — fast enough to read as light catching, slow enough not to strobe
+    glitterTwinkleHz: 3.5,
+    glitterSettle: 0.55,          // alpha multiplier a glint freezes at, so none settles invisible mid-sine
+    // m between crush-trail stamps; the min-step gate that makes addTrail safe to call every frame at any speed
+    trailStep: 1.4,
+    // trail width as a multiple of the roller's full width — slightly wider than the drum, as a crush would be
+    trailWidthScale: 1.15,
+    // stamp length as a multiple of trailStep; >1 so consecutive marks overlap into a continuous strip
+    trailLengthScale: 1.6,
+    trailAlpha: 0.50,             // scorch opacity
+    trailColor: 0x1a1512,         // near-black scorch, chroma 0.031 — the crushed strip the roller leaves
   },
 
   // ────────────────────────────────────────────────────────────────── post fx
