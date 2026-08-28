@@ -13,9 +13,9 @@
 import { TUNING } from '../tuning.js';
 import { clamp, clamp01, semitones } from '../core/math.js';
 import { fxRng } from '../core/rng.js';
-import { AudioEngine, makeParams, resetParams, massTerm01 } from './engine.js';
+import { AudioEngine, makeParams, resetParams, weightTerm01 } from './engine.js';
 import { SourceBank, loadHowler, makeHowlSource } from './sources.js';
-import { renderBanks, makeNoiseBuffer, makeLoopBuffer, bankKeys, COMBO_BASE_HZ } from './synth.js';
+import { renderBanks, makeNoiseBuffer, makeLoopBuffer, bankKeys } from './synth.js';
 import { ImpactPlayer } from './impacts.js';
 import { MusicSystem } from './music.js';
 import { RollingLayer } from './rolling.js';
@@ -49,8 +49,18 @@ export class AudioSystem {
     this._muted = false;
 
     this._musicIntensity = 0;
-    this._musicBlocked = false;
+    this._zone = -1;
+    this._zoneFloor = 0;
+    /** Audio-clock time until which a recent block keeps the music stripped. */
+    this._blockedUntil = -1e9;
     this._filterSweep = 0;
+
+    /** Absorb crowd control — a 30-object frame must not fire 30 chimes. */
+    this._absorbWindow = -1e9;
+    this._absorbCount = 0;
+    /** Last chain length seen on the per-frame state, so `playAbsorb` can
+     *  climb the ladder even when the caller does not pass one. */
+    this._chain = 0;
 
     this._noiseBuf = null;
     this._rumbleLoop = null;
@@ -180,9 +190,15 @@ export class AudioSystem {
   // ───────────────────────────────────────────────────────────── per-frame
 
   /**
+   * Allocation-free: reads scalars off a state object the caller reuses and
+   * never retains it. No literals, closures or array methods in here.
+   *
    * @param {number} dt UNSCALED seconds
-   * @param {object} s  { speed, speed01, mass, grounded, airborne, timeScale,
-   *                      playing, combo } — reused by the caller, never retained.
+   * @param {object} s  { speed, speed01, weight, grounded, airborne, timeScale,
+   *                      playing, chain, zone, blockerDistance } — reused by the
+   *                      caller, never retained. `blockerDistance` is optional;
+   *                      without it the blocker hum never rises. `mass` and
+   *                      `combo` are accepted as v1 aliases for weight and chain.
    */
   update(dt, s) {
     if (!this._ready || this._disposed) return;
@@ -192,18 +208,31 @@ export class AudioSystem {
     // damp() into the rolling/wind state and silences them for the rest of the run.
     const speed = s && isFinite(s.speed) ? s.speed : 0;
     const speed01 = s && isFinite(s.speed01) ? clamp01(s.speed01) : 0;
-    const mass = s && isFinite(s.mass) && s.mass > 0 ? s.mass : TUNING.player.startMass;
+    let weight = TUNING.player.startWeight;
+    if (s && isFinite(s.weight) && s.weight > 0) weight = s.weight;
+    else if (s && isFinite(s.mass) && s.mass > 0) weight = s.mass;
     const airborne = s ? (s.airborne === true || s.grounded === false) : false;
     const playing = s ? s.playing !== false : false;
-    const combo = s && isFinite(s.combo) ? s.combo : 0;
+    let chain = 0;
+    if (s && isFinite(s.chain)) chain = s.chain;
+    else if (s && isFinite(s.combo)) chain = s.combo;
+    this._chain = chain;
     const timeScale = s && isFinite(s.timeScale) ? s.timeScale : 1;
+    if (s && isFinite(s.zone)) this.setZone(s.zone);
 
-    this.rolling.update(dt, speed, speed01, mass, !airborne, playing);
+    this.rolling.setBlockerDistance(s && isFinite(s.blockerDistance) ? s.blockerDistance : Infinity);
+    this.rolling.update(dt, speed, speed01, weight, !airborne, playing);
 
-    // Music intensity: combo-driven, with any explicit setMusicIntensity as a floor.
-    const full = TUNING.audio.musicComboFull > 0 ? TUNING.audio.musicComboFull : 12;
-    const comboI = clamp01(combo / full);
-    this.music.setIntensity(comboI > this._musicIntensity ? comboI : this._musicIntensity);
+    // Music intensity: chain-driven, with any explicit setMusicIntensity as a floor.
+    const full = TUNING.audio.musicChainFull > 0 ? TUNING.audio.musicChainFull : 12;
+    const chainI = clamp01(chain / full);
+    this.music.setIntensity(chainI > this._musicIntensity ? chainI : this._musicIntensity);
+
+    // Strip the arrangement back to drums while the player has just been blocked
+    // OR has stopped moving. Both say the same thing — you are not rolling, and
+    // that is your fault — and the band dropping out says it louder than the HUD.
+    const stopped = playing && speed < TUNING.audio.musicStoppedSpeed;
+    this.music.setStripped(stopped || this.engine.now < this._blockedUntil);
     this.music.setPlaying(playing);
 
     // Slow-motion automatically closes the music filter; setFilterSweep is a floor.
@@ -217,67 +246,206 @@ export class AudioSystem {
 
   // ────────────────────────────────────────────────────────────── one-shots
 
-  playImpact(materialKey, outcome, objectMass, playerMass, pan, intensity01) {
+  playImpact(materialKey, outcome, objectWeight, playerWeight, pan, intensity01) {
     if (!this._ready || this._disposed) return;
-    this.impacts.play(materialKey, outcome, objectMass, playerMass, pan, intensity01);
+    this.impacts.play(materialKey, outcome, objectWeight, playerWeight, pan, intensity01);
   }
 
-  playPickup(value, playerMass) {
+  /**
+   * The weight of a smashed object arriving on the counter.
+   *
+   * Three things happen at once, because absorbing IS three things at once:
+   *
+   *   combo.ding   a pitched note that climbs with the chain — the reward you
+   *                chase, and the only layer that knows about the chain at all.
+   *   absorb.coin  one to three bright metallic taps, more taps for a bigger
+   *                object: money landing on a steel counter.
+   *   absorb.till  a low till clunk, but ONLY when the object was a large share
+   *                of what you currently weigh. This is the layer that separates
+   *                "another bottle crate" from "that was a silo".
+   *
+   * The share, not the absolute weight, drives the bottom end: a 5 t truck at
+   * 500 kg should sound enormous, and the same truck at 90 t should not.
+   *
+   * @param {number} objectWeight  kg absorbed
+   * @param {number} playerWeight  kg the roller weighs AFTER absorbing
+   * @param {number} [chain]       current chain length, 1-based. Omit it and the
+   *                               last value seen on the per-frame state is used,
+   *                               so the ladder still climbs for callers that
+   *                               only pass the two weights.
+   */
+  playAbsorb(objectWeight, playerWeight, chain) {
     if (!this._ready || this._disposed) return;
     const A = TUNING.audio;
-    const vals = TUNING.mass.pickupValues;
-    let tier = 0;
-    for (let i = 0; i < vals.length; i++) if (value >= vals[i]) tier = i;
+    const now = this.engine.now;
 
-    resetParams(P);
-    P.bus = 'sfx';
-    P.gain = A.pickupGain * (0.85 + 0.15 * tier);
-    P.rate = semitones(tier * 4) * (1 + fxRng.spread(0.02));
-    P.pan = 0;
-    this.bank.play(this.engine, 'pickup.chime', P);
-
-    if (tier >= vals.length - 1) {
-      // the big one lands with weight
-      this.impacts.sub(playerMass, 0.45, 0);
+    // Crowd control. A pile-up resolves a dozen absorbs inside one frame and the
+    // impact layers already carry that; past `absorbCrowdMax` in a window the
+    // chime drops out entirely rather than eating the 24-voice pool, and the
+    // ones that do play scale down so the window reads as one arrival.
+    if (now - this._absorbWindow > A.impactWindow) {
+      this._absorbWindow = now;
+      this._absorbCount = 0;
     }
-  }
+    this._absorbCount++;
+    if (this._absorbCount > A.absorbCrowdMax) return;
+    const crowd = 1 / Math.sqrt(this._absorbCount);
 
-  /** Rising pentatonic ding. combo starts at 1. Players will chase this. */
-  playCombo(combo, playerMass) {
-    if (!this._ready || this._disposed) return;
-    const A = TUNING.audio;
+    const ow = objectWeight > 0 && isFinite(objectWeight) ? objectWeight : 100;
+    const pw = playerWeight > 0 ? playerWeight : TUNING.player.startWeight;
+    const share = clamp01(ow / pw);
+
+    // ── the chain note
     const scale = A.comboScale;
     const n = scale.length > 0 ? scale.length : 1;
-    const c = Math.max(1, Math.floor(combo)) - 1;
-    const idx = c % n;
+    const c = Math.max(1, Math.floor(chain || this._chain || 1)) - 1;
     // The ding has to keep rising — it is the sound players chase. Capping the
-    // octave made combo 11 bit-identical to combo 6.
+    // octave made chain 11 bit-identical to chain 6.
     const oct = Math.min(A.comboMaxOctaves, Math.floor(c / n));
-    const semi = scale[idx] + 12 * oct;
-    const rootScale = A.comboRootHz / COMBO_BASE_HZ;
-    const rate = rootScale * semitones(semi);
+    const rate = semitones(scale[c % n] + 12 * oct);
 
     resetParams(P);
     P.bus = 'sfx';
-    P.gain = A.comboGain * (0.85 + 0.15 * clamp01(c / 8));
+    P.gain = A.comboGain * crowd * (0.85 + 0.15 * clamp01(c / 8));
     P.rate = rate;
     P.pan = 0;
     P.protect = true;
     this.bank.play(this.engine, 'combo.ding', P);
 
-    if (combo >= A.comboSparkleAt) {
+    if (c + 1 >= A.comboSparkleAt) {
       resetParams(P);
       P.bus = 'sfx';
-      P.gain = A.comboGain * 0.4;
+      P.gain = A.comboGain * 0.4 * crowd;
       P.rate = rate * 2;
       P.pan = 0.25;
-      P.when = this.engine.now + 0.035;
+      P.when = now + 0.035;
       this.bank.play(this.engine, 'combo.ding', P);
     }
 
-    // a little weight under the reward, so a heavy run's dings feel heavier
-    const mt = massTerm01(playerMass);
-    if (mt > 0.05) this.impacts.sub(playerMass, 0.22 + 0.2 * mt, 0);
+    // ── the coins
+    const taps = 1 + Math.round(clamp01(share / A.absorbTillShare) * (A.absorbMaxTaps - 1));
+    const drop = A.absorbShareSemitones * share;
+    for (let i = 0; i < taps; i++) {
+      resetParams(P);
+      P.bus = 'sfx';
+      P.gain = A.absorbCoinGain * crowd * (1 - i * 0.18) * (0.6 + 0.4 * share);
+      P.rate = semitones(A.absorbTapSemitones[i % A.absorbTapSemitones.length] + drop) *
+        (1 + fxRng.spread(0.02));
+      P.pan = fxRng.spread(0.18);
+      P.when = now + i * A.absorbSpacing;
+      this.bank.play(this.engine, 'absorb.coin', P);
+    }
+
+    // ── the till, and the weight under it
+    if (share >= A.absorbTillShare) {
+      resetParams(P);
+      P.bus = 'sfx';
+      P.gain = A.absorbGain * crowd * (0.7 + 0.3 * share);
+      P.rate = clamp(1 - 0.25 * share, A.rateMin, A.rateMax);
+      P.pan = 0;
+      P.when = now + A.absorbSpacing * 1.5;
+      P.protect = true;
+      this.bank.play(this.engine, 'absorb.till', P);
+      this.impacts.sub(pw, 0.35 + 0.5 * share, 0);
+    }
+  }
+
+  /**
+   * A strike, layered ON TOP of the blocked impact rather than instead of it.
+   *
+   * This is deliberately the most alarming sound in the game. It is the only
+   * feedback for the only mistake that ends runs, and it has to cut through six
+   * simultaneous shatters — so it is a rising three-blip alarm, it starts higher
+   * on every successive strike, and the LAST strike inverts: it drops seven
+   * semitones into a dread tone instead of climbing. You should be able to hear
+   * that the run just ended without reading the HUD.
+   *
+   * @param {number} strikes  strikes used AFTER this hit, 1-based
+   */
+  playStrike(strikes) {
+    if (!this._ready || this._disposed) return;
+    const A = TUNING.audio;
+    const n = Math.max(1, Math.floor(strikes || 1));
+    const last = n >= TUNING.collision.maxStrikes;
+    const root = A.strikeStrikeSemitones * (n - 1);
+    const blips = last ? 4 : 3;
+
+    for (let i = 0; i < blips; i++) {
+      const semi = last
+        ? root + A.strikeFinalSemitones * i          // falling: the run is over
+        : root + A.strikeStepSemitones * i;          // rising: a warning
+      resetParams(P);
+      P.bus = 'sfx';
+      P.gain = (A.strikeGain + A.strikeGainPerStrike * (n - 1)) * (1 - i * 0.10);
+      P.rate = semitones(semi);
+      P.pan = i % 2 === 0 ? -0.18 : 0.18;
+      P.when = this.engine.now + i * A.strikeSpacing;
+      P.protect = true;                              // never stolen by debris
+      this.bank.play(this.engine, 'strike.alarm', P);
+    }
+
+    this.engine.duck(A.blockedDuckDb * (last ? 1.6 : 1), A.blockedDuckHold * (last ? 4 : 2));
+    if (last) this.impacts.sub(TUNING.player.maxWeight, 1.2, 0);
+  }
+
+  /**
+   * The house. One event, two outcomes, and they must not sound alike.
+   *
+   * WIN is the biggest sound the game makes: a 3.4 s collapse with every layer
+   * behind it and no duck at all. HOLD is the opposite — a short dead slam, the
+   * music does not come back, and the silence afterwards does the work.
+   */
+  playHouseHit(win) {
+    if (!this._ready || this._disposed) return;
+    const A = TUNING.audio;
+    resetParams(P);
+    P.bus = 'sfx';
+    P.gain = A.houseHitGain * (win ? 1 : 0.85);
+    P.rate = 1;
+    P.pan = 0;
+    P.protect = true;
+    this.bank.play(this.engine, win ? 'house.win' : 'house.hold', P);
+    this.impacts.sub(TUNING.player.maxWeight, win ? 1.6 : 1.0, 0);
+
+    if (win) {
+      this.setMusicBlocked(false);
+    } else {
+      this.engine.duck(A.blockedDuckDb * 2, A.blockedDuckHold * 8);
+      // The house holding is the end of the run, so this strip does NOT release
+      // on the usual timer — the silence afterwards is the point.
+      this._blockedUntil = this.engine.now + 1e6;
+      this.music.setStripped(true);
+    }
+  }
+
+  /**
+   * Zone changed.
+   *
+   * The music layers on intensity while the v2 design layers on zone, so the zone
+   * sets an intensity FLOOR: descending the ramp opens the arrangement up and it
+   * never closes again, while the chain still pushes above the floor. Idempotent,
+   * because the per-frame state pushes the current zone every frame.
+   */
+  setZone(zoneIndex) {
+    if (this._disposed) return;
+    const z = Math.max(0, Math.floor(zoneIndex || 0));
+    if (z === this._zone) return;
+    this._zone = z;
+    const zones = TUNING.weights.zones.length;
+    this._zoneFloor = zones > 1 ? clamp01(z / (zones - 1)) * 0.55 : 0;
+    if (this._zoneFloor > this._musicIntensity) this._musicIntensity = this._zoneFloor;
+    if (!this._ready) return;
+    this.music.setZone(z);
+  }
+
+  /**
+   * Metres to the nearest permanent blocker ahead, or Infinity. Drives the
+   * warning hum that fades in inside `TUNING.read.blockerHumRadius`. Optional —
+   * `update()` also reads it off the per-frame state as `s.blockerDistance`.
+   */
+  setBlockerDistance(metres) {
+    if (!this._ready || this._disposed) return;
+    this.rolling.setBlockerDistance(metres);
   }
 
   playJump() {
@@ -289,19 +457,19 @@ export class AudioSystem {
     this.bank.play(this.engine, 'jump.whoosh', P);
   }
 
-  playLand(intensity01, playerMass) {
+  playLand(intensity01, playerWeight) {
     if (!this._ready || this._disposed) return;
     const A = TUNING.audio;
     const i01 = clamp01(intensity01);
-    const mass = playerMass > 0 ? playerMass : TUNING.player.startMass;
+    const w = playerWeight > 0 ? playerWeight : TUNING.player.startWeight;
     resetParams(P);
     P.bus = 'sfx';
     P.gain = A.landGain * (0.4 + 0.6 * i01);
-    P.rate = clamp(Math.pow(TUNING.player.startMass / mass, A.massPitchExp) * (1 + fxRng.spread(0.05)),
+    P.rate = clamp(Math.pow(TUNING.player.startWeight / w, A.weightPitchExp) * (1 + fxRng.spread(0.05)),
       A.rateMin, A.rateMax);
     P.pan = 0;
     this.bank.play(this.engine, 'land.thud', P);
-    this.impacts.sub(mass, 0.55 + 0.5 * i01, 0);
+    this.impacts.sub(w, 0.55 + 0.5 * i01, 0);
     if (i01 > 0.6) this.engine.duck(A.duckAmountDb * 0.6, A.duckHold * 0.5);
   }
 
@@ -315,18 +483,45 @@ export class AudioSystem {
     this.bank.play(this.engine, key, P);
   }
 
+  // ── v1 names, kept so anything that still calls them keeps working ───────
+
+  /** @deprecated the chain ding is one layer of `playAbsorb` now. */
+  playCombo(chain, playerWeight) {
+    this.playAbsorb(TUNING.player.startWeight * 0.4, playerWeight, chain);
+  }
+
+  /** @deprecated there are no separate pickups in v2 — objects ARE the pickups. */
+  playPickup(value, playerWeight) {
+    this.playAbsorb(value, playerWeight, 1);
+  }
+
   // ──────────────────────────────────────────────────────────────── music
 
   setMusicIntensity(t01) {
-    this._musicIntensity = clamp01(t01);
+    // The zone floor is the ramp's own progress; an explicit intensity may only
+    // push the music up from there, never drag it back to the first zone's mix.
+    const t = clamp01(t01);
+    this._musicIntensity = t > this._zoneFloor ? t : this._zoneFloor;
     if (!this._ready || this._disposed) return;
     this.music.setIntensity(this._musicIntensity);
   }
 
+  /**
+   * True strips the arrangement back to drums. It RELEASES ITSELF after
+   * `TUNING.audio.musicBlockedHold` seconds, because "has just been blocked" is
+   * a moment, not a state: a player who never smashes again should still hear
+   * the band come back rather than roll to the house over a bare drum loop.
+   * Passing false clears it immediately, which is what a successful smash does.
+   */
   setMusicBlocked(b) {
-    this._musicBlocked = !!b;
-    if (!this._ready || this._disposed) return;
-    this.music.setBlocked(this._musicBlocked);
+    if (this._disposed) return;
+    if (!this._ready) {
+      this._blockedUntil = b ? 1e9 : -1e9;
+      return;
+    }
+    const now = this.engine.now;
+    this._blockedUntil = b ? now + TUNING.audio.musicBlockedHold : -1e9;
+    this.music.setStripped(!!b);
   }
 
   /** 0 = open, 1 = heavily filtered. Used during slow-motion. */
@@ -418,8 +613,13 @@ export class AudioSystem {
   /** Run restart: kill tails, drop the music back to base, silence the loops. */
   reset() {
     this._musicIntensity = 0;
-    this._musicBlocked = false;
+    this._blockedUntil = -1e9;
     this._filterSweep = 0;
+    this._zone = -1;
+    this._zoneFloor = 0;
+    this._absorbWindow = -1e9;
+    this._absorbCount = 0;
+    this._chain = 0;
     if (!this._ready || this._disposed) return;
     this.engine.stopAllVoices(0.05);
     this.impacts.reset();

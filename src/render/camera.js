@@ -1,5 +1,5 @@
 import * as THREE from 'three/webgpu';
-import { TUNING, massRatio } from '../tuning.js';
+import { TUNING } from '../tuning.js';
 import { clamp01, lerp, smoothDamp, damp } from '../core/math.js';
 
 const _look = new THREE.Vector3();
@@ -43,8 +43,8 @@ export class ChaseCamera {
   reset(x, y, z) {
     const T = TUNING.camera;
     this.px = x;
-    this.py = y + T.baseHeight;
-    this.pz = z + T.baseDistance;
+    this.py = y + T.minHeight;
+    this.pz = z + T.minDistance;
     this.vel[0] = this.vel[1] = this.vel[2] = 0;
     this.trauma = 0;
     this.fovKick = 0;
@@ -56,8 +56,10 @@ export class ChaseCamera {
   }
 
   /** trauma is 0..1 and accumulates; the shake is trauma squared. */
-  addTrauma(amount, mass) {
-    const scale = mass ? Math.pow(massRatio(mass), TUNING.shake.traumaMassExp) : 1;
+  addTrauma(amount, weight) {
+    const scale = weight
+      ? Math.pow(weight / TUNING.player.startWeight, TUNING.shake.traumaWeightExp)
+      : 1;
     this.trauma = Math.min(TUNING.shake.maxTrauma, this.trauma + amount * scale);
   }
 
@@ -75,16 +77,25 @@ export class ChaseCamera {
    * @param {number} speed01   0..1 speed fraction
    * @param {number} mass      player mass
    */
-  update(dt, px, py, pz, d, speed01, mass, lateralVel) {
+  /**
+   * @param dt        unscaled frame time
+   * @param px,py,pz  interpolated roller position
+   * @param d         travel distance
+   * @param speed01   0..1 speed fraction
+   * @param weight    current weight (only used for shake scaling)
+   */
+  update(dt, px, py, pz, d, speed01, weight, lateralVel, radius, speed) {
     const T = TUNING.camera;
-    const massPull = Math.pow(massRatio(mass), T.distanceMassExp);
-    const dist = lerp(T.baseDistance, T.maxDistance, speed01) * massPull;
-    const height = lerp(T.baseHeight, T.maxHeight, speed01) * massPull;
 
-    // Desired anchor: straight up the hill from the player, held a fixed height
-    // above the road so slope changes do not pitch the camera into the ground.
+    // Distance and height come from the roller's RADIUS, so it always fills a
+    // similar slice of screen however big it gets; speed adds a little extra
+    // pull-back on top so fast reads as fast.
+    const r = radius || 1;
+    const dist = Math.max(T.minDistance, r * T.distancePerRadius) * (1 + T.speedPullback * speed01);
+    const height = Math.max(T.minHeight, r * T.heightPerRadius) * (1 + T.speedPullback * 0.5 * speed01);
+
     const anchorD = d - dist;
-    const targetX = px * 0.86; // let the player drift toward frame edges when steering
+    const targetX = px * 0.86;
     const targetY = this.groundAt(anchorD) + height;
     const targetZ = pz + dist;
 
@@ -92,7 +103,6 @@ export class ChaseCamera {
     this.py = smoothDamp(this.py, targetY, this.vel, 1, T.smoothTime * 1.1, dt);
     this.pz = smoothDamp(this.pz, targetZ, this.vel, 2, T.smoothTime, dt);
 
-    // ── trauma shake
     let sx = 0, sy = 0, sz = 0, sroll = 0;
     if (this.trauma > 0) {
       this.shakeTime += dt * TUNING.shake.frequency;
@@ -104,25 +114,24 @@ export class ChaseCamera {
       sroll = Math.sin(this.shakeTime * 1.19 + s * 5.3) * TUNING.shake.rotMagnitude * t2;
       this.trauma = Math.max(0, this.trauma - TUNING.shake.decay * dt);
     }
-
     this.camera.position.set(this.px + sx, this.py + sy, this.pz + sz);
 
-    // Aim down the hill, a little ahead of the roller.
-    const aheadD = d + T.lookAhead;
+    // Aim measured in TIME, not metres, and lifted so roughly four seconds of ramp
+    // stays on screen. Forward visibility beats a cinematic low angle: if the two
+    // ever conflict, visibility wins.
+    const aheadD = d + T.lookAheadSeconds * Math.max(8, speed || 0);
     _look.set(
       px * 0.86,
-      this.groundAt(aheadD) + T.lookHeight,
+      this.groundAt(aheadD) + T.lookHeight + height * T.pitchLift,
       -aheadD,
     );
     this.camera.up.copy(_up);
     this.camera.lookAt(_look);
 
-    // Bank slightly into the steer, plus shake roll. Small — this is spice.
-    const targetRoll = -clamp01(Math.abs(lateralVel) / 16) * Math.sign(lateralVel) * 0.055;
+    const targetRoll = -clamp01(Math.abs(lateralVel) / 16) * Math.sign(lateralVel) * 0.05;
     this.roll = damp(this.roll, targetRoll, 0.002, dt);
     this.camera.rotateZ(this.roll + sroll);
 
-    // ── FOV
     if (this.fovKickTimer > 0) {
       this.fovKickTimer -= dt;
       if (this.fovKickTimer <= 0) this.fovKick = 0;

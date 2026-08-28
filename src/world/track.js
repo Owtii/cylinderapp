@@ -2,81 +2,83 @@ import { TUNING } from '../tuning.js';
 import { DEG } from '../core/math.js';
 
 /**
- * The hill's centreline profile.
+ * The ramp's centreline profile.
  *
- * Coordinates: the player travels toward -Z. `d` ("distance") is travel distance
- * in metres and increases forward, so `z = -d`. The surface descends, so
- * `y = heightAt(d)` returns negative values that get more negative as d grows.
+ * Coordinates: the player travels toward -Z. `d` is travel distance in metres and
+ * increases forward, so `z = -d`. The ramp descends, so `heightAt(d)` returns
+ * values that get more negative as d grows.
  *
- * Chunks are piecewise-linear: each has a constant slope, and each starts where
- * the previous one ended, so the road is C0-continuous with no seams.
+ * Piecewise-linear over arbitrary-length segments (v1 assumed fixed 80 m chunks;
+ * zones here are whatever length their pacing target works out to, and the finale
+ * steepens on its own schedule).
  */
 export class TrackProfile {
   constructor() {
-    this.chunkLength = TUNING.world.chunkLength;
-    /** Slope (radians) per chunk index. */
-    this.slopes = [];
-    /** World Y at the *start* of each chunk index. */
-    this.startY = [0];
+    this.starts = [0];       // d at the start of segment i
+    this.slopes = [];        // radians
+    this.startY = [0];       // world Y at the start of segment i
+    this.length = 0;
   }
 
   reset() {
+    this.starts.length = 1; this.starts[0] = 0;
     this.slopes.length = 0;
-    this.startY.length = 1;
-    this.startY[0] = 0;
+    this.startY.length = 1; this.startY[0] = 0;
+    this.length = 0;
   }
 
-  /** Append a chunk with the given slope, in degrees. Returns its index. */
-  pushChunk(slopeDeg) {
-    const idx = this.slopes.length;
+  /** Append a segment. Returns its index. */
+  push(lengthM, slopeDeg) {
+    const i = this.slopes.length;
     const rad = slopeDeg * DEG;
     this.slopes.push(rad);
-    this.startY[idx + 1] = this.startY[idx] - Math.tan(rad) * this.chunkLength;
-    return idx;
+    this.starts[i] = this.length;
+    this.length += lengthM;
+    this.starts[i + 1] = this.length;
+    this.startY[i + 1] = this.startY[i] - Math.tan(rad) * lengthM;
+    return i;
   }
 
-  get chunkCount() {
-    return this.slopes.length;
-  }
-
-  chunkIndexAt(d) {
-    const i = Math.floor(d / this.chunkLength);
-    if (i < 0) return 0;
-    if (i >= this.slopes.length) return Math.max(0, this.slopes.length - 1);
+  /** Index of the segment containing d (clamped to the ends). */
+  indexAt(d) {
+    const n = this.slopes.length;
+    if (n === 0) return 0;
+    // Segments are few (tens), and lookups are coherent, so a guarded linear scan
+    // from a remembered cursor beats a binary search here.
+    let i = this._cursor || 0;
+    if (i >= n) i = n - 1;
+    while (i > 0 && d < this.starts[i]) i--;
+    while (i < n - 1 && d >= this.starts[i + 1]) i++;
+    this._cursor = i;
     return i;
   }
 
   slopeAt(d) {
     if (this.slopes.length === 0) return TUNING.world.baseSlopeDeg * DEG;
-    return this.slopes[this.chunkIndexAt(d)];
+    return this.slopes[this.indexAt(d)];
   }
 
-  /** Road surface height at travel distance `d`. */
   heightAt(d) {
     if (this.slopes.length === 0) return -Math.tan(TUNING.world.baseSlopeDeg * DEG) * d;
-    const i = this.chunkIndexAt(d);
-    const local = d - i * this.chunkLength;
-    return this.startY[i] - Math.tan(this.slopes[i]) * local;
+    const i = this.indexAt(d);
+    return this.startY[i] - Math.tan(this.slopes[i]) * (d - this.starts[i]);
   }
 
-  /** Height at the start of chunk `i`. */
-  chunkStartY(i) {
-    return this.startY[Math.min(i, this.startY.length - 1)];
-  }
-
-  /** Convert a world position to travel distance. */
   static dFromZ(z) { return -z; }
   static zFromD(d) { return -d; }
 }
 
-/** Half-width of the drivable road. */
 export const ROAD_HALF = TUNING.world.roadWidth / 2;
+export const LANE_WIDTH = TUNING.world.laneWidth;
 
-/** Lane centre x for lane index 0..laneCount-1. */
 export function laneX(lane) {
   const n = TUNING.world.laneCount;
-  const w = TUNING.world.roadWidth / n;
-  return -ROAD_HALF + w * (lane + 0.5);
+  return (lane - (n - 1) / 2) * TUNING.world.laneWidth;
 }
 
-export const LANE_WIDTH = TUNING.world.roadWidth / TUNING.world.laneCount;
+/** Lane index containing x, clamped into range. */
+export function laneAt(x) {
+  const n = TUNING.world.laneCount;
+  const i = Math.floor((x + ROAD_HALF) / TUNING.world.laneWidth);
+  return i < 0 ? 0 : i >= n ? n - 1 : i;
+}

@@ -1,5 +1,5 @@
 import RAPIER from '@dimforge/rapier3d-compat';
-import { TUNING, massRatio } from '../tuning.js';
+import { TUNING, weightRatio } from '../tuning.js';
 import { clamp, clamp01, moveTowards } from '../core/math.js';
 import { GROUPS_PLAYER } from './world.js';
 import { ROAD_HALF } from '../world/track.js';
@@ -25,9 +25,9 @@ export class Player {
   constructor(physics) {
     this.physics = physics;
 
-    this.mass = TUNING.player.startMass;
+    this.weight = TUNING.player.startWeight;
     this.radius = TUNING.player.baseRadius;
-    this.halfWidth = TUNING.player.width * 0.5;
+    this.halfWidth = TUNING.player.baseRadius * TUNING.player.widthRatio * 0.5;
 
     this.x = 0; this.y = 0; this.z = 0;
     this.prevX = 0; this.prevY = 0; this.prevZ = 0;
@@ -47,12 +47,10 @@ export class Player {
     this.justLaunched = false;
 
     this.inputLateral = 0;
-    this.inputTuck = false;
-    this.tuckTimer = 0;
-    this.tuckCooldown = 0;
     this.steerLockout = 0;
 
     this.dead = false;
+    this.strikes = 0;
     this.fallTimer = 0;
     this.slopeNormalY = 1;
     this.slopeNormalZ = 0;
@@ -71,7 +69,7 @@ export class Player {
   }
 
   reset() {
-    this.mass = TUNING.player.startMass;
+    this.weight = TUNING.player.startWeight;
     this._recomputeDerived();
     this.x = 0;
     this.d = 0;
@@ -91,46 +89,45 @@ export class Player {
     this.landImpact = 0;
     this.justLaunched = false;
     this.inputLateral = 0;
-    this.inputTuck = false;
-    this.tuckTimer = 0;
-    this.tuckCooldown = 0;
     this.steerLockout = 0;
     this.dead = false;
+    this.strikes = 0;
     this.fallTimer = 0;
     this.slopeNormalY = 1;
     this.slopeNormalZ = 0;
     this._syncBody();
   }
 
-  // ── derived stats ────────────────────────────────────────────────────────────
+  // ── derived stats ───────────────────────────────────────────────────────────
   _recomputeDerived() {
     const P = TUNING.player;
-    const r = massRatio(this.mass);
+    const r = weightRatio(this.weight);
+    // Cube root: absorbing 200x your starting weight makes you ~6x wider, not 200x.
     this.radius = Math.min(P.maxRadius, P.baseRadius * Math.pow(r, P.radiusExp));
-    const baseHalf = Math.min(P.maxWidth, P.width * Math.pow(r, P.widthExp)) * 0.5;
-    this.fullHalfWidth = baseHalf;
-    this.halfWidth = this.tuckTimer > 0 ? baseHalf * P.tuckWidthScale : baseHalf;
-    this.topSpeed = Math.min(
-      P.topSpeedCap,
-      P.baseTopSpeed * Math.pow(r, P.topSpeedExp),
-    ) * (this.tuckTimer > 0 ? P.tuckSpeedBonus : 1);
+    this.halfWidth = this.radius * P.widthRatio * 0.5;
+    this.topSpeed = Math.min(P.topSpeedCap, P.baseTopSpeed * Math.pow(r, P.topSpeedExp));
+    // Lateral agility drops as you grow. Heavy means committed — this is the cost
+    // of power and the source of the late-game tension.
     this.lateralSpeed = P.baseLateralSpeed * Math.pow(1 / r, P.lateralSpeedExp);
-    this.lateralAccel = (P.baseLateralSpeed / P.lateralAccelTime) / Math.pow(r, P.lateralAccelExp);
-    this.lateralDecel = (P.baseLateralSpeed / P.lateralDecelTime) / Math.pow(r, P.lateralAccelExp);
+    this.lateralAccel = this.lateralSpeed / P.lateralAccelTime;
+    this.lateralDecel = this.lateralSpeed / P.lateralDecelTime;
   }
 
   get speed01() {
     return clamp01(this.speed / Math.max(1, this.topSpeed));
   }
 
-  addMass(kg) {
-    this.mass = clamp(this.mass + kg, TUNING.player.minMass, TUNING.player.maxMass);
+  /** Smashing something adds its full weight. This is the whole growth system. */
+  absorb(kg) {
+    this.weight = clamp(this.weight + kg, TUNING.player.startWeight, 1e9);
     this._recomputeDerived();
+    return this.weight;
   }
 
-  loseMassFraction(f) {
-    const lost = this.mass * f;
-    this.mass = Math.max(TUNING.player.minMass, this.mass - lost);
+  /** A blocked hit costs a fraction of everything you have built. */
+  loseWeightFraction(f) {
+    const lost = this.weight * f;
+    this.weight = Math.max(TUNING.player.startWeight * 0.5, this.weight - lost);
     this._recomputeDerived();
     return lost;
   }
@@ -140,30 +137,29 @@ export class Player {
     this.speed *= (1 - fraction);
   }
 
-  /** BLOCKED: rebound up the hill, near-total speed loss, brief steer lockout. */
+  /**
+   * BLOCKED: rebound, near-total speed loss, a strike, and 10 % of your weight.
+   * Speed recovers on its own — the ramp does that work — so being stopped is lost
+   * time and lost weight, not a death.
+   * @returns {number} kilos lost
+   */
   blockedResponse() {
     const C = TUNING.collision;
     this.speed = -C.blockedRebound;
     this.lateralVel *= -0.35;
     this.steerLockout = C.blockedLockout;
+    this.strikes++;
+    return this.loseWeightFraction(C.blockedWeightLoss);
   }
 
-  setInput(lateral, tuck) {
+  get strikedOut() {
+    return this.strikes >= TUNING.collision.maxStrikes;
+  }
+
+  setInput(lateral) {
     this.inputLateral = clamp(lateral, -1, 1);
-    this.inputTuck = !!tuck;
   }
 
-  tryTuck() {
-    if (this.tuckCooldown > 0 || this.tuckTimer > 0) return false;
-    this.tuckTimer = TUNING.player.tuckDuration;
-    this.tuckCooldown = TUNING.player.tuckCooldown;
-    this._recomputeDerived();
-    return true;
-  }
-
-  get tucking() {
-    return this.tuckTimer > 0;
-  }
 
   // ── simulation ───────────────────────────────────────────────────────────────
   /**
@@ -186,14 +182,6 @@ export class Player {
     this.landImpact = 0;
     this.justLaunched = false;
 
-    if (this.tuckTimer > 0) {
-      this.tuckTimer -= dt;
-      if (this.tuckTimer <= 0) {
-        this.tuckTimer = 0;
-        this._recomputeDerived();
-      }
-    }
-    if (this.tuckCooldown > 0) this.tuckCooldown -= dt;
     if (this.steerLockout > 0) this.steerLockout -= dt;
 
     // ── downhill speed, using the slope under us as of the last probe
@@ -210,7 +198,6 @@ export class Player {
       a = g * Math.sin(slope)
         + P.accelAssist * (1 - this.speed / V)
         - kDrag * this.speed * Math.abs(this.speed);
-      if (this.tuckTimer > 0) a += P.tuckAccel;
     } else {
       a = -kDrag * 0.35 * this.speed * Math.abs(this.speed);
     }
@@ -227,7 +214,7 @@ export class Player {
     this.x += this.lateralVel * dt;
 
     // Soft shoulder: the run is about what is in front of you, not about the verge.
-    const limit = ROAD_HALF - this.radius * 0.55;
+    const limit = ROAD_HALF - this.halfWidth;
     if (this.x > limit) {
       const over = this.x - limit;
       this.x = limit + over * Math.exp(-over / P.edgeSoftness) * 0.35;

@@ -1,97 +1,96 @@
-import { TUNING } from '../tuning.js';
-import { PULVERIZE, PLOW } from '../physics/collisions.js';
+import { TUNING, CLEAN, PLOW } from '../tuning.js';
 
 /**
- * Score, combo and run stats.
+ * Run statistics and the perfect chain.
  *
- * The combo is the thing players actually chase — it drives the music layering
- * and the rising pentatonic ding, so it needs to be trivially cheap to read.
+ * There is no points system in v2 — your weight IS your score, and the house is the
+ * target. What this tracks is the chain (consecutive smashes without a block, which
+ * ignites the roller and adds a music layer), the medal thresholds, and the numbers
+ * the run-end screen needs to make someone press restart.
  */
 export class Score {
   constructor() {
-    this.best = 0;
-    /**
-     * Ring buffer of kill timestamps for the slow-motion trigger. Allocated once
-     * and refilled with -Infinity rather than 0: simTime is 0 during the first
-     * fixed step of a run, so a zero sentinel makes those kills invisible to the
-     * trigger and silently costs a restart its first chain.
-     */
-    this.killTimes = new Float64Array(16);
+    this.best = { weight: 0, medal: null };
+    this.smashTimes = new Float64Array(16);
     this.reset();
   }
 
   reset() {
-    this.points = 0;
-    this.combo = 1;
-    this.comboTimer = 0;
-    this.destroyed = 0;
-    this.bestCombo = 1;
-    this.peakMass = TUNING.player.startMass;
-    this.killTimes.fill(-Infinity);
-    this.killCursor = 0;
-    this.lastDistanceScored = 0;
+    this.chain = 0;
+    this.bestChain = 0;
+    this.smashed = 0;
+    this.absorbed = 0;
+    this.blocked = 0;
+    this.nearMisses = 0;
+    this.zonesCleared = 0;
+    this.smashTimes.fill(-Infinity);
+    this.smashCursor = 0;
+    this.startTime = 0;
   }
 
-  /** @returns {number} points awarded for this kill (already combo-multiplied). */
-  registerKill(threshold, outcome, simTime) {
-    const S = TUNING.score;
-    const base = Math.max(
-      S.minPoints,
-      (isFinite(threshold) ? threshold : 0) * S.massToScore,
-    );
-    const styleBonus = outcome === PULVERIZE ? S.pulverizeBonus
-      : outcome === PLOW ? S.plowBonus : 0;
-    const gained = Math.round(base * styleBonus * this.combo);
-    this.points += gained;
-    this.destroyed++;
-
-    this.combo = Math.min(S.comboMax, this.combo + 1);
-    if (this.combo > this.bestCombo) this.bestCombo = this.combo;
-    this.comboTimer = S.comboWindow;
-
-    this.killTimes[this.killCursor] = simTime;
-    this.killCursor = (this.killCursor + 1) % this.killTimes.length;
-    return gained;
+  registerSmash(weight, outcome, simTime) {
+    this.smashed++;
+    if (isFinite(weight)) this.absorbed += weight;
+    this.chain++;
+    if (this.chain > this.bestChain) this.bestChain = this.chain;
+    this.smashTimes[this.smashCursor] = simTime;
+    this.smashCursor = (this.smashCursor + 1) % this.smashTimes.length;
+    return this.chain;
   }
 
-  /** True when `n` kills landed inside `window` seconds — the slow-mo trigger. */
-  killsWithin(n, windowSeconds, simTime) {
-    if (n > this.killTimes.length) return false;
+  registerBlock() {
+    this.blocked++;
+    this.chain = 0;
+  }
+
+  registerNearMiss() {
+    this.nearMisses++;
+  }
+
+  /** True when `n` smashes landed inside `window` seconds — the slow-motion trigger. */
+  smashesWithin(n, windowSeconds, simTime) {
+    if (n > this.smashTimes.length) return false;
     let count = 0;
-    for (let i = 0; i < this.killTimes.length; i++) {
-      // Unused slots hold -Infinity, so the window test alone rejects them.
-      if (simTime - this.killTimes[i] <= windowSeconds) count++;
+    for (let i = 0; i < this.smashTimes.length; i++) {
+      // Unused slots hold -Infinity, so the window test alone rejects them; a zero
+      // sentinel would collide with simTime 0 on the run's first fixed step.
+      if (simTime - this.smashTimes[i] <= windowSeconds) count++;
     }
     return count >= n;
   }
 
-  registerBlocked() {
-    this.combo = 1;
-    this.comboTimer = 0;
+  get ignited() {
+    return this.chain >= TUNING.score.chainIgniteAt;
   }
 
-  addDistancePoints(distance) {
-    const gain = distance - this.lastDistanceScored;
-    if (gain > 0) {
-      this.points += Math.round(gain * TUNING.score.distancePoints);
-      this.lastDistanceScored = distance;
-    }
+  /** 0..1 intensity for the music layering. */
+  get chainIntensity() {
+    return Math.min(1, this.chain / (TUNING.score.chainIgniteAt * 1.5));
   }
 
-  update(dt) {
-    if (this.comboTimer > 0) {
-      this.comboTimer -= dt;
-      if (this.comboTimer <= 0) this.combo = 1;
-    }
+  /** Which medal a final weight earns, or null. */
+  medalFor(weight) {
+    const h = TUNING.finale.houseWeight;
+    const M = TUNING.medals;
+    if (weight >= h * M.gold) return 'gold';
+    if (weight >= h * M.silver) return 'silver';
+    if (weight >= h * M.bronze) return 'bronze';
+    return null;
   }
 
-  /** 0..1 combo intensity used to drive the music layering. */
-  get intensity() {
-    return Math.min(1, (this.combo - 1) / 14);
+  /** The threshold the player is reaching for next, for the run-end screen. */
+  nextMedal(weight) {
+    const h = TUNING.finale.houseWeight;
+    const M = TUNING.medals;
+    if (weight < h * M.bronze) return { name: 'bronze', at: h * M.bronze };
+    if (weight < h * M.silver) return { name: 'silver', at: h * M.silver };
+    if (weight < h * M.gold) return { name: 'gold', at: h * M.gold };
+    return null;
   }
 
-  finish() {
-    if (this.points > this.best) this.best = this.points;
-    return this.best;
+  finish(weight) {
+    const medal = this.medalFor(weight);
+    if (weight > this.best.weight) this.best = { weight, medal };
+    return medal;
   }
 }

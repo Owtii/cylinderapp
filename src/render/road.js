@@ -5,9 +5,10 @@ import {
 import { TUNING } from '../tuning.js';
 import { ROAD_HALF, LANE_WIDTH } from '../world/track.js';
 
-const GRID_Z = TUNING.world.chunkGridZ;
 const LANES = TUNING.world.laneCount;
-const CELL_D = TUNING.world.chunkLength / GRID_Z;
+const SEG_LEN = TUNING.world.segmentLength;
+const GRID_Z = 8;                                   // rows of road cells per segment
+const CELL_D = SEG_LEN / GRID_Z;
 
 // Vertex budget per chunk. Worst case is every cell isolated: 48 tops, 96 walls,
 // 96 hazard strips. 260 quads is comfortable headroom and costs ~30 KB per chunk.
@@ -68,7 +69,7 @@ export class RoadBuilder {
     const slot = this._acquireSlot();
     const { pos, nrm, typ, idx } = slot;
     const prof = this.profile;
-    const d0 = chunkIndex * TUNING.world.chunkLength;
+    const d0 = chunkIndex * SEG_LEN;
     const slope = prof.slopeAt(d0 + 0.5);
     const tanS = Math.tan(slope);
     const cosS = Math.cos(slope);
@@ -193,29 +194,47 @@ export class RoadBuilder {
     const LIFT = 0.012;    // z-fight guard for markings
 
     // ── top surface: merge runs along travel per lane, one quad + one collider each
+    //
+    // A run may only merge rows that share a SLOPE. Zone boundaries and crests do
+    // not line up with the 40 m road segments, so a segment can straddle a slope
+    // change; building one collider across it with a single slope leaves a step the
+    // roller drops straight through — which reads to the player as falling off a
+    // flat crest for no reason.
+    const rowSlope = (row) => prof.slopeAt(d0 + (row + 0.5) * CELL_D);
+
     for (let lane = 0; lane < LANES; lane++) {
       const x0 = -ROAD_HALF + lane * LANE_WIDTH;
       const x1 = x0 + LANE_WIDTH;
       let run = -1;
+      let runSlope = 0;
       for (let row = 0; row <= GRID_Z; row++) {
         const isSolid = row < GRID_Z && cells[row * LANES + lane] === 1;
-        if (isSolid && run < 0) run = row;
-        if ((!isSolid || row === GRID_Z) && run >= 0) {
+        const sl = row < GRID_Z ? rowSlope(row) : NaN;
+        const breaks = run >= 0 && (!isSolid || row === GRID_Z || Math.abs(sl - runSlope) > 1e-6);
+
+        if (breaks) {
           const da = d0 + run * CELL_D;
           const db = d0 + row * CELL_D;
-          quad(x0, da, x1, db, 0, TYPE_TOP, 0, cosS, sinS, false);
+          const cs = Math.cos(runSlope);
+          const sn = -Math.sin(runSlope);
+          quad(x0, da, x1, db, 0, TYPE_TOP, 0, cs, sn, false);
 
-          // Extend the collider into any solid neighbour so no cap is exposed.
-          const ca = da - (solid(run - 1, lane) === 1 ? SEAM : 0);
-          const cb = db + (solid(row, lane) === 1 ? SEAM : 0);
+          // Extend into a solid neighbour of the SAME slope so no cap is exposed.
+          const upSame = solid(run - 1, lane) === 1
+            && (run === 0 || Math.abs(rowSlope(run - 1) - runSlope) <= 1e-6);
+          const downSame = solid(row, lane) === 1
+            && row < GRID_Z && Math.abs(sl - runSlope) <= 1e-6;
+          const ca = da - (upSame ? SEAM : 0);
+          const cb = db + (downSame ? SEAM : 0);
           const len = cb - ca;
           const midD = (ca + cb) * 0.5;
           colliders.push(this.physics.addSlab(
             (x0 + x1) * 0.5, prof.heightAt(midD), -midD,
-            LANE_WIDTH * 0.5, (len * 0.5) / cosS, slope, 3,
+            LANE_WIDTH * 0.5, (len * 0.5) / cs, runSlope, 3,
           ));
           run = -1;
         }
+        if (isSolid && run < 0) { run = row; runSlope = sl; }
       }
     }
 
@@ -320,8 +339,8 @@ export class RoadBuilder {
     slot.geo.attributes.aType.needsUpdate = true;
     slot.geo.index.needsUpdate = true;
     slot.geo.setDrawRange(0, i);
-    slot.geo.boundingSphere.center.set(0, prof.heightAt(d0 + 40), -(d0 + 40));
-    slot.geo.boundingSphere.radius = 90;
+    slot.geo.boundingSphere.center.set(0, prof.heightAt(d0 + SEG_LEN * 0.5), -(d0 + SEG_LEN * 0.5));
+    slot.geo.boundingSphere.radius = SEG_LEN * 1.6;
     slot.colliders = colliders;
 
     this.scene.add(slot.mesh);
@@ -361,7 +380,7 @@ function normalise(x, dz, dy) {
 
 /**
  * Road material: asphalt with lane dashes, solid shoulder lines, dark hole walls,
- * and hazard chevrons on any edge that borders a drop. All derived from world
+ * and white-on-charcoal chevrons on any edge that borders a drop. All derived from world
  * position — no textures to load, and it stays crisp at any distance.
  */
 function createRoadMaterial() {
@@ -383,16 +402,23 @@ function createRoadMaterial() {
   const shoulder = smoothstep(float(ROAD_HALF - 0.75), float(ROAD_HALF - 0.35), abs(wp.x));
 
   const paint = vec3(0.76, 0.74, 0.66);
-  const shoulderPaint = vec3(0.86, 0.72, 0.10);
+  // Shoulder lines were saturated yellow, running the full length of the road on
+  // both sides — permanently on screen, and close enough to the PLOW outline's
+  // amber to poison it (§6.1, colour monopoly). Saturated green, amber and red
+  // belong to the outline system and to nothing else, so the shoulder is now the
+  // same off-white as the lane paint, just brighter and solid.
+  const shoulderPaint = vec3(0.90, 0.89, 0.84);
 
   let top = mix(base, paint, laneLine.mul(dash).mul(interior).mul(0.85));
   top = mix(top, shoulderPaint, shoulder.mul(0.9));
 
   const wall = vec3(0.028, 0.030, 0.036);
 
-  // hazard chevrons: diagonal yellow/black
+  // Hazard chevrons at the lip of a hole: WHITE on charcoal, the same language the
+  // blockers use, so "this ends your run" looks the same wherever it appears — and
+  // so the only saturated colours on screen are still the three outline states.
   const stripe = step(float(0.5), fract(wp.x.add(wp.z).mul(0.62)));
-  const hazard = mix(vec3(0.05, 0.045, 0.04), vec3(0.95, 0.74, 0.05), stripe);
+  const hazard = mix(vec3(0.045, 0.045, 0.050), vec3(0.93, 0.93, 0.92), stripe);
 
   const isWall = step(float(0.5), type).mul(step(type, float(1.5)));
   const isHazard = step(float(1.5), type).mul(step(type, float(2.5)));
@@ -403,6 +429,6 @@ function createRoadMaterial() {
   color = mix(color, rampSteel, isRamp);
 
   mat.colorNode = vec4(color, 1.0);
-  mat.emissiveNode = hazard.mul(isHazard).mul(0.18);
+  mat.emissiveNode = hazard.mul(isHazard).mul(0.12);
   return mat;
 }

@@ -2,10 +2,10 @@
  * TONNAGE — continuous layers: the rolling rumble and the wind.
  *
  * Both must be dead silent when the run is not playing, must never click, and
- * must audibly change with BOTH speed and mass. Mass is the important one: a
+ * must audibly change with BOTH speed and weight. Weight is the important one: a
  * player should be able to tell they got heavier with their eyes shut.
  *
- * Mass changes four things at once:
+ * Weight changes four things at once:
  *   - rumble playback rate drops   (deeper grain)
  *   - the resonant body peak drops (bigger drum)
  *   - rumble gain rises            (more of it)
@@ -16,11 +16,17 @@
  * AudioParam.value, so there are no automation events piling up in the timeline
  * and no zipper noise. Loop sources are started once and never stopped —
  * silence is gain 0, which is the only click-free way to do it.
+ *
+ * A third layer lives here: the BLOCKER HUM. A permanent blocker is the one
+ * object that can end a run outright, so inside `TUNING.read.blockerHumRadius`
+ * a beating sub-bass drone fades in under everything else. It is driven by
+ * `setBlockerDistance()` (or `s.blockerDistance` on the per-frame state) and
+ * stays silent if nothing ever sets it.
  */
 
 import { TUNING } from '../tuning.js';
 import { clamp, clamp01, damp, lerp, TAU } from '../core/math.js';
-import { massTerm01 } from './engine.js';
+import { weightTerm01 } from './engine.js';
 
 const S_RUMBLE_GAIN = 0;
 const S_RUMBLE_CUT = 1;
@@ -30,7 +36,9 @@ const S_DRONE_HZ = 4;
 const S_DRONE_GAIN = 5;
 const S_WIND_GAIN = 6;
 const S_WIND_CUT = 7;
-const S_COUNT = 8;
+const S_HUM_GAIN = 8;
+const S_HUM_CUT = 9;
+const S_COUNT = 10;
 
 /** Seconds the reset fade takes. */
 const FADE_TIME = 0.06;
@@ -57,6 +65,17 @@ export class RollingLayer {
     this.windSrc = null;
     this.windBP = null;
     this.windGain = null;
+    this.humOscA = null;
+    this.humOscB = null;
+    this.humLP = null;
+    this.humGain = null;
+
+    /**
+     * Metres to the nearest permanent blocker, or Infinity. Optional: the game
+     * pushes it through `update`'s state object or `setBlockerDistance`, and if
+     * nobody ever does, the hum simply never rises above silence.
+     */
+    this._blockerDist = Infinity;
 
     /** Smoothed parameter state. Written every frame, never reallocated. */
     this.s = new Float64Array(S_COUNT);
@@ -135,10 +154,37 @@ export class RollingLayer {
     bp.connect(wg);
     wg.connect(eng.sfxIn);
 
+    // ── blocker hum: the only warning a permanent blocker gives you that is
+    //    not visual. Two oscillators a whisker apart so they BEAT — a steady
+    //    tone reads as ambience, a beating one reads as a threat.
+    const hA = ctx.createOscillator();
+    hA.type = 'sawtooth';
+    hA.frequency.value = A.blockerHumHz;
+
+    const hB = ctx.createOscillator();
+    hB.type = 'sine';
+    hB.frequency.value = A.blockerHumHz;
+    hB.detune.value = 9;
+
+    const hlp = ctx.createBiquadFilter();
+    hlp.type = 'lowpass';
+    hlp.frequency.value = 140;
+    hlp.Q.value = 2.4;
+
+    const hg = ctx.createGain();
+    hg.gain.value = 0;
+
+    hA.connect(hlp);
+    hB.connect(hlp);
+    hlp.connect(hg);
+    hg.connect(eng.sfxIn);
+
     const t = ctx.currentTime + 0.02;
     try { rs.start(t); } catch (e) { /* noop */ }
     try { osc.start(t); } catch (e) { /* noop */ }
     try { ws.start(t); } catch (e) { /* noop */ }
+    try { hA.start(t); } catch (e) { /* noop */ }
+    try { hB.start(t); } catch (e) { /* noop */ }
 
     this.rumbleSrc = rs;
     this.rumbleLP = lp;
@@ -150,7 +196,12 @@ export class RollingLayer {
     this.windSrc = ws;
     this.windBP = bp;
     this.windGain = wg;
+    this.humOscA = hA;
+    this.humOscB = hB;
+    this.humLP = hlp;
+    this.humGain = hg;
 
+    this.s[S_HUM_CUT] = 140;
     this.s[S_RUMBLE_CUT] = A.rollingCutoffMin;
     this.s[S_RUMBLE_RATE] = 1;
     this.s[S_PEAK_HZ] = A.rollingToneHz;
@@ -162,14 +213,23 @@ export class RollingLayer {
   }
 
   /**
+   * Metres to the nearest permanent blocker ahead. Anything at or beyond
+   * `TUNING.read.blockerHumRadius` is silence; it fades in from there.
+   * Pass Infinity (or nothing) when no blocker is in range.
+   */
+  setBlockerDistance(metres) {
+    this._blockerDist = (typeof metres === 'number' && metres >= 0) ? metres : Infinity;
+  }
+
+  /**
    * @param {number} dt        unscaled seconds
    * @param {number} speed     m/s
    * @param {number} speed01   0..1 normalised speed
-   * @param {number} mass      kg
+   * @param {number} weight    kg
    * @param {boolean} grounded
    * @param {boolean} playing
    */
-  update(dt, speed, speed01, mass, grounded, playing) {
+  update(dt, speed, speed01, weight, grounded, playing) {
     if (!this.ready || !this.engine.ready) return;
     if (!(dt > 0)) return;
     if (dt > 0.1) dt = 0.1;
@@ -180,9 +240,9 @@ export class RollingLayer {
 
     const muting = this.engine.now < this._muteUntil;
     const sp01 = clamp01(speed01);
-    const m = mass > 0 ? mass : P.startMass;
-    const mr = m / P.startMass;
-    const mt = massTerm01(m);
+    const w = weight > 0 ? weight : P.startWeight;
+    const mr = w / P.startWeight;
+    const mt = weightTerm01(w);
 
     // ── targets
     const speedCurve = Math.pow(sp01, 0.6);
@@ -190,17 +250,17 @@ export class RollingLayer {
     if (!playing) {
       tGain = 0;
     } else if (grounded) {
-      tGain = A.rollingBaseGain * (0.22 + 0.78 * speedCurve) * (1 + mt * A.rollingMassGain);
+      tGain = A.rollingBaseGain * (0.22 + 0.78 * speedCurve) * (1 + mt * A.rollingWeightGain);
     } else {
       tGain = A.rollingBaseGain * A.airborneRumbleScale * sp01;
     }
 
-    const massDark = Math.pow(1 / (mr > 0.01 ? mr : 0.01), 0.12);
-    // Mass darkens the rumble, but never below the tuned floor: at 400 t the
-    // darkening factor is 0.59, which would drag a 180 Hz idle down to ~106 Hz
+    const weightDark = Math.pow(1 / (mr > 0.01 ? mr : 0.01), 0.12);
+    // Weight darkens the rumble, but never below the tuned floor: at 140 t the
+    // darkening factor is 0.53, which would drag a 180 Hz idle down to ~96 Hz
     // and turn the roll into mud.
     const tCut = clamp(
-      lerp(A.rollingCutoffMin, A.rollingCutoffMax, Math.pow(sp01, 0.7)) * massDark,
+      lerp(A.rollingCutoffMin, A.rollingCutoffMax, Math.pow(sp01, 0.7)) * weightDark,
       A.rollingCutoffMin, A.rollingCutoffMax,
     );
     const tRate = clamp(Math.pow(1 / (mr > 0.01 ? mr : 0.01), A.rollingRateExp) * (0.85 + 0.4 * sp01), 0.35, 2.2);
@@ -217,7 +277,14 @@ export class RollingLayer {
     let tWindGain = playing ? A.windGainMax * Math.pow(sp01, 1.8) * (grounded ? 1 : 1.35) : 0;
     const tWindCut = lerp(A.windCutoffMin, A.windCutoffMax, sp01);
 
-    if (muting) { tGain = 0; tDroneGain = 0; tWindGain = 0; }
+    // blocker hum — squared so it is genuinely inaudible until the blocker is
+    // close enough to matter, then arrives fast
+    const humRadius = TUNING.read.blockerHumRadius > 1 ? TUNING.read.blockerHumRadius : 46;
+    const prox = this._blockerDist < humRadius ? clamp01(1 - this._blockerDist / humRadius) : 0;
+    let tHumGain = playing ? A.blockerHumGain * prox * prox : 0;
+    const tHumCut = lerp(110, 430, prox);
+
+    if (muting) { tGain = 0; tDroneGain = 0; tWindGain = 0; tHumGain = 0; }
 
     // ── smooth (framerate independent, click-free)
     const kr = A.rollingSmoothing;
@@ -230,6 +297,8 @@ export class RollingLayer {
     s[S_DRONE_GAIN] = damp(s[S_DRONE_GAIN], tDroneGain, kr, dt);
     s[S_WIND_GAIN] = damp(s[S_WIND_GAIN], tWindGain, kw, dt);
     s[S_WIND_CUT] = damp(s[S_WIND_CUT], tWindCut, kw, dt);
+    s[S_HUM_GAIN] = damp(s[S_HUM_GAIN], tHumGain, kr, dt);
+    s[S_HUM_CUT] = damp(s[S_HUM_CUT], tHumCut, kr, dt);
 
     // ── push
     this._set(S_RUMBLE_CUT, this.rumbleLP.frequency, 0.5);
@@ -237,10 +306,12 @@ export class RollingLayer {
     this._set(S_PEAK_HZ, this.rumblePeak.frequency, 0.25);
     this._set(S_DRONE_HZ, this.droneOsc.frequency, 0.05);
     this._set(S_WIND_CUT, this.windBP.frequency, 0.5);
+    this._set(S_HUM_CUT, this.humLP.frequency, 0.5);
     if (!muting) {
       this._set(S_RUMBLE_GAIN, this.rumbleGain.gain, 0.0004);
       this._set(S_DRONE_GAIN, this.droneGain.gain, 0.0004);
       this._set(S_WIND_GAIN, this.windGain.gain, 0.0004);
+      this._set(S_HUM_GAIN, this.humGain.gain, 0.0002);
     }
   }
 
@@ -261,10 +332,12 @@ export class RollingLayer {
    * smoothing rides down to 0 alongside it so the two agree when it lands.
    */
   reset() {
+    this._blockerDist = Infinity;
     if (!this.ready) {
       this.s[S_RUMBLE_GAIN] = 0;
       this.s[S_DRONE_GAIN] = 0;
       this.s[S_WIND_GAIN] = 0;
+      this.s[S_HUM_GAIN] = 0;
       return;
     }
     const A = TUNING.audio;
@@ -274,6 +347,8 @@ export class RollingLayer {
     s[S_RUMBLE_GAIN] = 0;
     s[S_DRONE_GAIN] = 0;
     s[S_WIND_GAIN] = 0;
+    s[S_HUM_GAIN] = 0;
+    s[S_HUM_CUT] = 140;
     s[S_RUMBLE_CUT] = A.rollingCutoffMin;
     s[S_RUMBLE_RATE] = 1;
     s[S_PEAK_HZ] = A.rollingToneHz;
@@ -286,6 +361,7 @@ export class RollingLayer {
     this._rampTo(this.rumbleGain.gain, 0, t);
     this._rampTo(this.droneGain.gain, 0, t);
     this._rampTo(this.windGain.gain, 0, t);
+    this._rampTo(this.humGain.gain, 0, t);
   }
 
   _rampTo(param, v, t) {
@@ -313,6 +389,8 @@ export class RollingLayer {
     stop(this.rumbleSrc);
     stop(this.droneOsc);
     stop(this.windSrc);
+    stop(this.humOscA);
+    stop(this.humOscB);
     dis(this.rumbleLP);
     dis(this.rumblePeak);
     dis(this.rumbleGain);
@@ -320,8 +398,12 @@ export class RollingLayer {
     dis(this.droneGain);
     dis(this.windBP);
     dis(this.windGain);
+    dis(this.humLP);
+    dis(this.humGain);
     this.rumbleSrc = null;
     this.droneOsc = null;
     this.windSrc = null;
+    this.humOscA = null;
+    this.humOscB = null;
   }
 }

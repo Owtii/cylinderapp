@@ -1,34 +1,55 @@
 /**
  * TONNAGE — HUD.
  *
- * Corners only. Score + combo top-left, the mass scale top-centre, distance
- * top-right. Nothing else: no minimap, no health bar, no clutter in the middle
- * of the screen where the hill is.
+ * Corners only, and only three things in them:
  *
- * The whole file is written to make zero allocations per frame:
- *  - every transform string the HUD can ever need is pre-built at module load
- *    (`SCALE_X`) or is a module constant,
- *  - digits are individual pooled <span>s and only the ones that actually
- *    changed are written (a real truck scale only moves the wheel that turned),
- *  - popups are a fixed pool of DOM nodes moved with `transform: translate3d`
- *    and never with `left`/`top`.
+ *   top-centre   the WEIGHT counter, with `TARGET 100,000 KG` welded under it
+ *   top-left     three strike pips, and the chain counter under them
+ *   right edge   a vertical progress rail, banded by zone, ending at the house
  *
- * The one unavoidable exception is `translate3d(...)` for popups and the score /
- * distance strings, which the DOM can only accept as text. Those are built only
- * when the underlying value actually changed, so a still frame allocates nothing.
+ * Nothing else. The middle of the screen belongs to the ramp, because the ramp
+ * is where every decision is made.
+ *
+ * The weight counter is the star. It rolls mechanically toward its new value
+ * (`TUNING.ui.weightTickTime`) instead of snapping, the `+1,500 KG` popup flies
+ * out of the object it came from and lands *in* the counter, and the counter
+ * punches when it lands. That loop — object, number, counter — is the whole
+ * reward structure of the game, so it is the only motion the HUD is allowed.
+ *
+ * COLOUR MONOPOLY: saturated green / amber / red belong to the outline system.
+ * The HUD's own accent is a cold bone-white; the strike pips read as spent by
+ * SHAPE (a stencilled ✕) and not by hue, so the whole HUD survives greyscale.
+ *
+ * Allocation: the per-frame path allocates nothing. Every class name, every
+ * `scaleX()` and every small integer the HUD can write is pre-built at module
+ * load. The one unavoidable exception is the popup's `translate` string, which
+ * the DOM only accepts as text — and that is written only when the rounded
+ * pixel position actually changed, so a still frame allocates nothing at all.
  */
 
 import { TUNING } from '../tuning.js';
-import { clamp, moveTowards, hash11 } from '../core/math.js';
+import { clamp, clamp01, moveTowards, smoothstep, hash11 } from '../core/math.js';
 
 /* ─────────────────────────────────────────── module constants (built once) ── */
 
 const DIGIT_CHARS = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'];
 
-/** Pre-built `scaleX()` strings so the combo bar never allocates. */
-const SCALE_STEPS = 100;
-const SCALE_X = new Array(SCALE_STEPS + 1);
-for (let i = 0; i <= SCALE_STEPS; i++) SCALE_X[i] = 'scaleX(' + (i / SCALE_STEPS) + ')';
+/** Small integers as strings, for CSS custom properties. 0..200 = 0..100 %. */
+const PROG_STEPS = 200;
+const NUM_STR = new Array(PROG_STEPS + 1);
+for (let i = 0; i <= PROG_STEPS; i++) NUM_STR[i] = '' + i;
+
+/** Pre-built chain counts, so a two-digit chain does not build a string. */
+const CHAIN_STR = new Array(200);
+for (let i = 0; i < 200; i++) CHAIN_STR[i] = '' + i;
+
+/** Scratch for the rail's band edges — the layout pass must not allocate. */
+const EDGES = new Float64Array(64);
+
+/** Pre-built `scaleX()` strings for the target bar. */
+const BAR_STEPS = 100;
+const SCALE_X = new Array(BAR_STEPS + 1);
+for (let i = 0; i <= BAR_STEPS; i++) SCALE_X[i] = 'scaleX(' + (i / BAR_STEPS) + ')';
 
 /** Where a popup goes when it is off-screen or dead. */
 const PARKED = '-9999px -9999px';
@@ -37,25 +58,50 @@ const CLS_HUD = 'hud';
 const CLS_HUD_ON = 'hud on';
 
 const CLS_POP = 'pop';
-const CLS_POP_A = 'pop pop-a';
-const CLS_POP_B = 'pop pop-b';
+const CLS_POP_A = 'pop fly-a';
+const CLS_POP_B = 'pop fly-b';
 
-const CLS_SCALE = 'scale';
-const CLS_SCALE_UP_A = 'scale up-a';
-const CLS_SCALE_UP_B = 'scale up-b';
-const CLS_SCALE_DOWN_A = 'scale down-a';
-const CLS_SCALE_DOWN_B = 'scale down-b';
-
-const CLS_COMBO = 'combo';
-const CLS_COMBO_ON = 'combo on';
-const CLS_COMBO_BODY = 'combo-body';
-const CLS_COMBO_BODY_A = 'combo-body pa';
-const CLS_COMBO_BODY_B = 'combo-body pb';
+const CLS_WEIGH = 'weigh';
+const CLS_WEIGH_UP_A = 'weigh gain-a';
+const CLS_WEIGH_UP_B = 'weigh gain-b';
+const CLS_WEIGH_DOWN_A = 'weigh loss-a';
+const CLS_WEIGH_DOWN_B = 'weigh loss-b';
 
 const CLS_DIGIT = 'reel-d';
 const CLS_DIGIT_DIM = 'reel-d z';
 const CLS_SEP = 'reel-sep';
 const CLS_SEP_DIM = 'reel-sep z';
+
+const CLS_TARGET = 'tgt';
+const CLS_TARGET_MET = 'tgt met';
+
+const CLS_CHAIN = 'chain';
+const CLS_CHAIN_ON = 'chain on';
+const CLS_CHAIN_LIT = 'chain on lit';
+const CLS_CHAIN_BODY = 'chain-body';
+const CLS_CHAIN_BODY_A = 'chain-body pa';
+const CLS_CHAIN_BODY_B = 'chain-body pb';
+
+const CLS_PIP = 'pip';
+const CLS_PIP_SPENT = 'pip spent';
+const CLS_PIP_SPENT_A = 'pip spent hit-a';
+const CLS_PIP_SPENT_B = 'pip spent hit-b';
+
+const CLS_BAND = 'zband';
+const CLS_BAND_PAST = 'zband past';
+const CLS_BAND_NOW = 'zband now';
+const CLS_BAND_FINALE = 'zband finale';
+const CLS_BAND_FINALE_NOW = 'zband finale now';
+
+const CLS_BANNER = 'banner';
+const CLS_BANNER_GOOD = 'banner on good';
+const CLS_BANNER_WARN = 'banner on warn';
+const CLS_BANNER_INFO = 'banner on info';
+
+const TXT_TARGET = 'TARGET';
+const TXT_TARGET_MET = 'TARGET MET';
+
+const DEFAULT_POP_COLOUR = '#e9e2d0';
 
 /* ───────────────────────────────────────────────── projection scratch state ── */
 /* Plain numbers, not an object: projecting a popup allocates nothing. */
@@ -64,7 +110,7 @@ let _projY = 0;
 let _projOk = false;
 
 /**
- * Project a world point to CSS pixels using the camera's matrices directly.
+ * Project a world point to CSS pixels straight from the camera's matrices.
  * Assumes an unscaled (rigid) camera world matrix, which a chase camera always is.
  */
 function project(camera, wx, wy, wz, width, height) {
@@ -82,7 +128,7 @@ function project(camera, wx, wy, wz, width, height) {
   const vz = dx * mw[8] + dy * mw[9] + dz * mw[10];
 
   const cw = pm[3] * vx + pm[7] * vy + pm[11] * vz + pm[15];
-  if (cw <= 1e-5) return; // behind the eye
+  if (cw <= 1e-5) return;                       // behind the eye
 
   const cx = pm[0] * vx + pm[4] * vy + pm[8] * vz + pm[12];
   const cy = pm[1] * vx + pm[5] * vy + pm[9] * vz + pm[13];
@@ -92,7 +138,7 @@ function project(camera, wx, wy, wz, width, height) {
   _projOk = true;
 }
 
-/** Thousands-grouped integer, without `toLocaleString` (which is slow and allocates). */
+/** Thousands-grouped integer without `toLocaleString` (slow, and it allocates). */
 function groupInt(v) {
   let n = v < 0 ? 0 : v;
   if (n < 10) return DIGIT_CHARS[n];
@@ -104,6 +150,28 @@ function groupInt(v) {
     out = ',' + (r < 10 ? '00' : r < 100 ? '0' : '') + r + out;
   }
   return n + out;
+}
+
+/* A tiny cache so `addPopup` can take 0x35d07f as happily as '#35d07f' without
+   building a string on every impact. */
+const HEX_N = 8;
+const hexKeys = new Int32Array(HEX_N).fill(-1);
+const hexVals = new Array(HEX_N);
+for (let i = 0; i < HEX_N; i++) hexVals[i] = DEFAULT_POP_COLOUR;
+let hexCursor = 0;
+
+function colourString(c) {
+  if (typeof c === 'string') return c;
+  if (typeof c !== 'number' || !isFinite(c)) return DEFAULT_POP_COLOUR;
+  const key = c | 0;
+  for (let i = 0; i < HEX_N; i++) if (hexKeys[i] === key) return hexVals[i];
+  let s = (key >>> 0).toString(16);
+  while (s.length < 6) s = '0' + s;
+  const out = '#' + s;
+  hexKeys[hexCursor] = key;
+  hexVals[hexCursor] = out;
+  hexCursor = hexCursor + 1 >= HEX_N ? 0 : hexCursor + 1;
+  return out;
 }
 
 function mk(tag, cls, parent, text) {
@@ -126,67 +194,97 @@ export class Hud {
     root.setAttribute('aria-hidden', 'true');
     while (root.firstChild) root.removeChild(root.firstChild);
 
-    // Feel numbers that only CSS needs are handed over as custom properties, so
-    // TUNING stays the single source of truth without any per-frame style work.
+    // Feel numbers CSS needs are handed over as custom properties once, so
+    // TUNING stays the single source of truth with no per-frame style work.
     const st = root.style;
     st.setProperty('--hud-fade', U.hudFadeTime + 's');
-    st.setProperty('--mass-punch', '' + U.massPunchScale);
-    st.setProperty('--mass-punch-time', U.massPunchTime + 's');
-    st.setProperty('--combo-punch', '' + U.comboPunchScale);
-    st.setProperty('--combo-punch-time', U.comboPunchTime + 's');
+    st.setProperty('--weigh-punch', '' + U.weightPunchScale);
+    st.setProperty('--weigh-punch-time', U.weightPunchTime + 's');
+    st.setProperty('--chain-punch', '' + U.chainPunchScale);
+    st.setProperty('--chain-punch-time', U.chainPunchTime + 's');
+    st.setProperty('--strike-punch-time', U.strikePunchTime + 's');
+    st.setProperty('--target-pulse', U.targetPulseTime + 's');
     st.setProperty('--pop-life', U.popupLife + 's');
+    st.setProperty('--banner-fade', U.bannerFade + 's');
 
-    /* ── top-left: score + combo ───────────────────────────────────────────── */
+    /* ── label layer ───────────────────────────────────────────────────────
+       Owned by MODULE A's LabelSystem; it lives underneath the HUD furniture so
+       a label can never sit on top of the weight counter. Handed over by
+       `hud.labelRoot`. */
+    this.labelLayer = mk('div', 'hud-labels', root);
+
+    /* ── top-left: strikes, then chain ─────────────────────────────────────── */
     const tl = mk('div', 'hud-zone hud-tl', root);
-    const scorePlate = mk('div', 'plate plate-score', tl);
-    mk('div', 'plate-label', scorePlate, 'SCORE');
-    this.elScore = mk('div', 'plate-value score-value', scorePlate, '0');
 
-    this.elCombo = mk('div', CLS_COMBO, tl);
-    this.elComboBody = mk('div', CLS_COMBO_BODY, this.elCombo);
-    mk('span', 'combo-x', this.elComboBody, '×');
-    this.elComboN = mk('span', 'combo-n', this.elComboBody, '2');
-    mk('span', 'combo-tag', this.elComboBody, 'CHAIN');
-    const comboBar = mk('div', 'combo-bar', this.elCombo);
-    this.elComboFill = mk('i', 'combo-fill', comboBar);
+    const strikeBox = mk('div', 'strikes', tl);
+    this.elPips = mk('div', 'pips', strikeBox);
+    mk('div', 'strikes-tag', strikeBox, 'STRIKES');
+    this.pipEls = [];
+    this.pipState = null;                 // Uint8Array, sized on first setStrikes
+    this.pipFlip = null;
+    this.strikeMax = 0;
+    this.strikeUsed = 0;
+    this._buildPips(TUNING.collision.maxStrikes);
 
-    /* ── top-centre: the scale ─────────────────────────────────────────────── */
+    this.elChain = mk('div', CLS_CHAIN, tl);
+    this.elChainBody = mk('div', CLS_CHAIN_BODY, this.elChain);
+    mk('span', 'chain-x', this.elChainBody, '×');
+    this.elChainN = mk('span', 'chain-n', this.elChainBody, '0');
+    mk('span', 'chain-tag', this.elChainBody, 'CHAIN');
+
+    /* ── top-centre: the weight counter (the star) ─────────────────────────── */
     const tc = mk('div', 'hud-zone hud-tc', root);
-    this.elScale = mk('div', CLS_SCALE, tc);
-    const head = mk('div', 'scale-head', this.elScale);
-    mk('span', 'scale-tape', head);
-    mk('span', 'scale-title', head, 'GROSS MASS');
-    mk('span', 'scale-tape', head);
+    this.elWeigh = mk('div', CLS_WEIGH, tc);
 
-    const win = mk('div', 'scale-window', this.elScale);
+    const win = mk('div', 'weigh-window', this.elWeigh);
     const reel = mk('div', 'reel', win);
 
-    const nd = Math.max(3, U.massDigits | 0);
-    this.massDigits = new Array(nd);
-    this.massDigitVals = new Int8Array(nd).fill(-1);
-    this.massSeps = [];
-    this.massSepPower = [];
+    const nd = Math.max(3, U.weightDigits | 0);
+    this.weightDigits = new Array(nd);
+    this.weightDigitVals = new Int8Array(nd).fill(-1);
+    this.weightSeps = [];
+    this.weightSepPower = [];
     for (let i = nd - 1; i >= 0; i--) {
       if (i < nd - 1 && ((i + 1) % 3) === 0) {
-        this.massSeps.push(mk('span', CLS_SEP, reel, ','));
-        this.massSepPower.push(i + 1);
+        this.weightSeps.push(mk('span', CLS_SEP, reel, ','));
+        this.weightSepPower.push(i + 1);
       }
-      this.massDigits[i] = mk('span', CLS_DIGIT, reel, '0');
+      this.weightDigits[i] = mk('span', CLS_DIGIT, reel, '0');
     }
-    this.massMax = Math.pow(10, nd) - 1;
-    mk('span', 'scale-unit', win, 'KG');
+    this.weightMax = Math.pow(10, nd) - 1;
+    mk('span', 'weigh-unit', win, 'KG');
 
-    const foot = mk('div', 'scale-foot', this.elScale);
-    this.elTonnes = mk('span', 'scale-tonnes', foot, '5.0 T');
-    mk('span', 'scale-cert', foot, 'CLASS III · NO LIMIT');
+    // The target lives welded to the underside of the counter — the player must
+    // never have to remember what they are building toward.
+    this.elTarget = mk('div', CLS_TARGET, this.elWeigh);
+    this.elTargetLabel = mk('span', 'tgt-k', this.elTarget, TXT_TARGET);
+    this.elTargetValue = mk('span', 'tgt-v', this.elTarget, '0');
+    mk('span', 'tgt-u', this.elTarget, 'KG');
 
-    /* ── top-right: distance ───────────────────────────────────────────────── */
-    const tr = mk('div', 'hud-zone hud-tr', root);
-    const distPlate = mk('div', 'plate plate-dist', tr);
-    mk('div', 'plate-label', distPlate, 'DISTANCE');
-    const distVal = mk('div', 'plate-value', distPlate);
-    this.elDist = mk('span', 'dist-num', distVal, '0');
-    mk('span', 'plate-unit', distVal, 'M');
+    const tgTrack = mk('div', 'tgt-track', this.elWeigh);
+    this.elTargetFill = mk('i', 'tgt-fill', tgTrack);
+
+    /* ── right edge: the progress rail ─────────────────────────────────────── */
+    const rail = mk('div', 'hud-prog', root);
+    this.elRail = mk('div', 'prog-rail', rail);
+    this.elBands = mk('div', 'prog-bands', this.elRail);
+    this.elProgFill = mk('i', 'prog-fill', this.elRail);
+    this.elProgHead = mk('i', 'prog-head', this.elRail);
+    mk('i', 'prog-house', this.elRail);
+    this.bandEls = [];
+    this.bandCount = 0;
+    this.bandFinale = false;
+    this.bandSig = -1;
+    this.bandSrc = null;
+    this.zoneIndex = -1;
+    this.progStep = -1;
+    this.elRail.style.setProperty('--p', NUM_STR[0]);
+
+    /* ── zone recap banner (transient, centre-top) ─────────────────────────── */
+    this.elBanner = mk('div', CLS_BANNER, root);
+    this.elBannerText = mk('div', 'banner-text', this.elBanner, '');
+    this.bannerTimer = 0;
+    this.bannerOn = false;
 
     /* ── popup pool ────────────────────────────────────────────────────────── */
     this.elPopups = mk('div', 'hud-popups', root);
@@ -194,6 +292,7 @@ export class Hud {
     this.popCount = pc;
     this.popEls = new Array(pc);
     this.popAlive = new Uint8Array(pc);
+    this.popGain = new Uint8Array(pc);
     this.popFlip = new Uint8Array(pc);
     this.popLife = new Float32Array(pc);
     this.popX = new Float32Array(pc);
@@ -201,7 +300,6 @@ export class Hud {
     this.popZ = new Float32Array(pc);
     this.popVX = new Float32Array(pc);
     this.popVY = new Float32Array(pc);
-    this.popVZ = new Float32Array(pc);
     this.popLastX = new Float32Array(pc).fill(-9999);
     this.popLastY = new Float32Array(pc).fill(-9999);
     for (let i = 0; i < pc; i++) {
@@ -213,99 +311,158 @@ export class Hud {
     this.popCursor = 0;
     this.popSeed = 1;
 
-    /* ── state ─────────────────────────────────────────────────────────────── */
-    this.massTarget = TUNING.player.startMass;
-    this.massShown = this.massTarget;
-    this.massRate = 0;
-    this.massInt = -1;
-    this.massSig = -1;
-    this.tonnes10 = -1;
+    // Where popups fly to: the middle of the weight window, in CSS pixels.
+    this.anchorX = 0;
+    this.anchorY = 0;
+    this.anchorW = -1;
+    this.anchorH = -1;
 
-    this.scoreVal = -1;
-    this.distVal = -1;
-    this.combo = 1;
-    this.comboOn = false;
-    this.comboTimer = 0;
-    this.comboBarStep = -1;
-    this.comboFlip = 0;
-    this.scaleFlip = 0;
+    /* ── state ─────────────────────────────────────────────────────────────── */
+    this.weightTarget = TUNING.player.startWeight;
+    this.weightShown = this.weightTarget;
+    this.weightRate = 0;
+    this.weightInt = -1;
+    this.weightSig = -1;
+    this.targetKg = TUNING.finale.houseWeight;
+    this.targetMet = false;
+    this.targetBarStep = -1;
+    this.weighFlip = 0;
+
+    this.chain = 0;
+    this.chainShown = -1;
+    this.chainLit = false;
+    this.chainOn = false;
+    this.chainFlip = 0;
 
     this.visible = false;
 
-    this._writeMass();
-    this._writeComboBar(0);
+    this.setTarget(this.targetKg);
+    this._writeWeight();
+    this.setStrikes(0, TUNING.collision.maxStrikes);
+  }
+
+  /** The DOM element MODULE A's LabelSystem should be constructed with. */
+  get labelRoot() {
+    return this.labelLayer;
   }
 
   /* ── public API ─────────────────────────────────────────────────────────── */
 
-  /** Set the target mass. The readout ticks toward it like a weighbridge. */
-  setMass(kg) {
+  /** Set the weight. The reel rolls toward it like a weighbridge, never snaps. */
+  setWeight(kg) {
     const v = kg > 0 ? kg : 0;
-    if (v === this.massTarget) return;
-    const up = v > this.massTarget;
-    this.massTarget = v;
-    const delta = Math.abs(v - this.massShown);
-    this.massRate = delta / Math.max(1e-4, TUNING.mass.hudTickTime);
+    if (v === this.weightTarget) return;
+    const up = v > this.weightTarget;
+    this.weightTarget = v;
+    const delta = Math.abs(v - this.weightShown);
+    this.weightRate = delta / Math.max(1e-4, TUNING.ui.weightTickTime);
 
-    this.scaleFlip ^= 1;
-    if (up) {
-      this.elScale.className = this.scaleFlip ? CLS_SCALE_UP_A : CLS_SCALE_UP_B;
-    } else {
-      this.elScale.className = this.scaleFlip ? CLS_SCALE_DOWN_A : CLS_SCALE_DOWN_B;
-    }
+    // A loss is the only thing that shakes the plate; a gain punches it. The
+    // shake is a shape, not a colour, so it survives greyscale.
+    this.weighFlip ^= 1;
+    if (up) this.elWeigh.className = this.weighFlip ? CLS_WEIGH_UP_A : CLS_WEIGH_UP_B;
+    else this.elWeigh.className = this.weighFlip ? CLS_WEIGH_DOWN_A : CLS_WEIGH_DOWN_B;
   }
 
-  setDistance(m) {
-    const v = m > 0 ? Math.round(m) : 0;
-    if (v === this.distVal) return;
-    this.distVal = v;
-    this.elDist.textContent = groupInt(v);
+  /** The house weight. Printed under the counter and never hidden. */
+  setTarget(kg) {
+    const v = kg > 0 ? Math.round(kg) : 0;
+    if (v === this.targetKg && this.elTargetValue.textContent !== '0') return;
+    this.targetKg = v;
+    this.elTargetValue.textContent = groupInt(v);
+    this.targetBarStep = -1;
+    this._writeTargetBar();
   }
 
-  setScore(points, combo) {
-    const p = points > 0 ? Math.round(points) : 0;
-    if (p !== this.scoreVal) {
-      this.scoreVal = p;
-      this.elScore.textContent = groupInt(p);
-    }
-
-    const c = combo > 0 ? combo | 0 : 1;
-    if (c !== this.combo) {
-      this.combo = c;
-      const on = c >= TUNING.ui.comboMin;
-      if (on) this.elComboN.textContent = c < 10 ? DIGIT_CHARS[c] : '' + c;
-      if (on !== this.comboOn) {
-        this.comboOn = on;
-        this.elCombo.className = on ? CLS_COMBO_ON : CLS_COMBO;
+  /** Three pips, top-left. A spent pip is stencilled with a ✕, not coloured. */
+  setStrikes(used, max) {
+    const m = Math.max(1, (max || TUNING.collision.maxStrikes) | 0);
+    if (m !== this.strikeMax) this._buildPips(m);
+    const u = clamp(used | 0, 0, m);
+    if (u === this.strikeUsed) return;
+    const grew = u > this.strikeUsed;
+    this.strikeUsed = u;
+    for (let i = 0; i < m; i++) {
+      const spent = i < u ? 1 : 0;
+      if (this.pipState[i] === spent && !(grew && i === u - 1)) continue;
+      this.pipState[i] = spent;
+      if (!spent) {
+        this.pipEls[i].className = CLS_PIP;
+      } else if (grew && i === u - 1) {
+        this.pipFlip[i] ^= 1;
+        this.pipEls[i].className = this.pipFlip[i] ? CLS_PIP_SPENT_A : CLS_PIP_SPENT_B;
+      } else {
+        this.pipEls[i].className = CLS_PIP_SPENT;
       }
-      if (!on) this.comboTimer = 0;
     }
   }
 
-  /** Punch the multiplier and refill its decay bar. Called on every kill. */
-  comboPop() {
-    this.comboTimer = TUNING.score.comboWindow;
-    this.comboFlip ^= 1;
-    this.elComboBody.className = this.comboFlip ? CLS_COMBO_BODY_A : CLS_COMBO_BODY_B;
-  }
+  /**
+   * The vertical rail down the right edge.
+   *
+   * `t01` is the run's completion, 0 at the start line and 1 at the house.
+   * `zones` may be the plan's zone array (objects carrying `dStart`/`dEnd`, or a
+   * `t` fraction), an array of plain 0..1 fractions, or simply a zone count —
+   * all four are laid out identically. `zoneIndex` is the zone the player is in;
+   * pass the zone count (or anything past the last index) once the finale
+   * run-up has started and the finale band lights instead.
+   */
+  setProgress(t01, zones, zoneIndex) {
+    this._syncBands(zones);
 
-  /** Per-frame, unscaled dt. Drives the mass tick-up and the combo decay bar. */
-  update(dt) {
-    if (this.massShown !== this.massTarget) {
-      this.massShown = moveTowards(this.massShown, this.massTarget, this.massRate * dt);
-      this._writeMass();
+    const zi = zoneIndex === undefined || zoneIndex === null ? -1 : zoneIndex | 0;
+    if (zi !== this.zoneIndex) {
+      this.zoneIndex = zi;
+      const n = this.bandCount;
+      for (let i = 0; i < n; i++) {
+        const finale = i === n - 1 && this.bandFinale;
+        const cls = i === zi
+          ? (finale ? CLS_BAND_FINALE_NOW : CLS_BAND_NOW)
+          : i < zi
+            ? (finale ? CLS_BAND_FINALE : CLS_BAND_PAST)
+            : (finale ? CLS_BAND_FINALE : CLS_BAND);
+        this.bandEls[i].className = cls;
+      }
     }
 
-    if (this.comboTimer > 0) {
-      this.comboTimer -= dt;
-      if (this.comboTimer < 0) this.comboTimer = 0;
-    }
-    const w = TUNING.score.comboWindow;
-    this._writeComboBar(w > 0 ? this.comboTimer / w : 0);
+    let step = (clamp01(t01) * PROG_STEPS + 0.5) | 0;
+    if (step < 0) step = 0;
+    else if (step > PROG_STEPS) step = PROG_STEPS;
+    if (step === this.progStep) return;
+    this.progStep = step;
+    this.elRail.style.setProperty('--p', NUM_STR[step]);
   }
 
-  /** Floating world-anchored score number. Pooled — never allocates a node. */
-  addPopup(text, wx, wy, wz, color) {
+  /** Consecutive smashes. Ignites at `TUNING.score.chainIgniteAt`. */
+  setChain(n) {
+    const c = n > 0 ? n | 0 : 0;
+    if (c === this.chain) return;
+    const grew = c > this.chain;
+    this.chain = c;
+
+    const on = c >= TUNING.ui.chainShowAt;
+    const lit = c >= TUNING.score.chainIgniteAt;
+    if (on && c !== this.chainShown) {
+      this.chainShown = c;
+      this.elChainN.textContent = c < 200 ? CHAIN_STR[c] : '' + c;
+    }
+    if (on !== this.chainOn || lit !== this.chainLit) {
+      this.chainOn = on;
+      this.chainLit = lit;
+      this.elChain.className = !on ? CLS_CHAIN : lit ? CLS_CHAIN_LIT : CLS_CHAIN_ON;
+    }
+    if (on && grew) {
+      this.chainFlip ^= 1;
+      this.elChainBody.className = this.chainFlip ? CLS_CHAIN_BODY_A : CLS_CHAIN_BODY_B;
+    }
+  }
+
+  /**
+   * A weight-gain number that flies out of the object and into the counter.
+   * `colour` may be a CSS string or a 0xRRGGBB number (the outline palette).
+   * Pooled — this never creates a node.
+   */
+  addPopup(text, wx, wy, wz, colour) {
     const U = TUNING.ui;
     const n = this.popCount;
 
@@ -325,18 +482,18 @@ export class Hud {
 
     this.popAlive[idx] = 1;
     this.popLife[idx] = 0;
+    this.popGain[idx] = (typeof text === 'string' && text.charCodeAt(0) === 43) ? 1 : 0;
     this.popX[idx] = wx;
     this.popY[idx] = wy;
     this.popZ[idx] = wz;
-    this.popVX[idx] = (h1 * 2 - 1) * U.popupDrift;
+    this.popVX[idx] = (h1 * 2 - 1) * 1.4;
     this.popVY[idx] = U.popupRise * (0.85 + h2 * 0.3);
-    this.popVZ[idx] = (h2 * 2 - 1) * U.popupDrift * 0.5;
     this.popLastX[idx] = -9999;
     this.popLastY[idx] = -9999;
 
     const el = this.popEls[idx];
     el.textContent = text;
-    el.style.color = color;
+    el.style.color = colourString(colour);
     el.style.translate = PARKED;
     // Swapping between two identical animations restarts it without a reflow.
     this.popFlip[idx] ^= 1;
@@ -344,8 +501,10 @@ export class Hud {
   }
 
   /**
-   * Integrate and re-project the live popups. `camera` is a THREE camera; the
-   * projection is done by hand from its matrices (see `project`).
+   * Integrate the live popups and re-project them. For the first
+   * `TUNING.ui.popupHang` of their life they hang above the object they came
+   * from; after that they accelerate into the weight counter and shrink, and
+   * the counter punches when they land. That is the money shot.
    */
   updatePopups(dt, camera, width, height) {
     const n = this.popCount;
@@ -354,8 +513,12 @@ export class Hud {
 
     const U = TUNING.ui;
     const life = U.popupLife;
-    const g = U.popupGravity;
+    const hang = clamp01(U.popupHang);
     const margin = U.popupCullMargin;
+
+    if (width !== this.anchorW || height !== this.anchorH) this._measureAnchor(width, height);
+    const ax = this.anchorX;
+    const ay = this.anchorY;
 
     // Keep the popups locked to the frame that is about to be drawn.
     if (camera.updateMatrixWorld) camera.updateMatrixWorld();
@@ -371,19 +534,30 @@ export class Hud {
         el.style.translate = PARKED;
         this.popLastX[i] = -9999;
         this.popLastY[i] = -9999;
+        if (this.popGain[i] === 1) this._punch();
         continue;
       }
       this.popLife[i] = t;
 
-      this.popVY[i] += g * dt;
-      this.popX[i] += this.popVX[i] * dt;
-      this.popY[i] += this.popVY[i] * dt;
-      this.popZ[i] += this.popVZ[i] * dt;
+      const u = t / life;
+      // World drift, damped: the number lifts off the wreck, then stops rising.
+      const damp = u < hang ? 1 : 0.25;
+      this.popX[i] += this.popVX[i] * dt * damp;
+      this.popY[i] += this.popVY[i] * dt * damp;
 
       project(camera, this.popX[i], this.popY[i], this.popZ[i], width, height);
-      if (!_projOk
-        || _projX < -margin || _projX > width + margin
-        || _projY < -margin || _projY > height + margin) {
+
+      let px;
+      let py;
+      const k = hang >= 1 ? 0 : smoothstep((u - hang) / (1 - hang));
+      if (_projOk) {
+        px = _projX + (ax - _projX) * k;
+        py = _projY + (ay - _projY) * k;
+      } else if (k > 0.02) {
+        // Behind the camera but already homing: fly in from the bottom edge.
+        px = ax;
+        py = height + (ay - height) * k;
+      } else {
         if (this.popLastX[i] !== -9999) {
           el.style.translate = PARKED;
           this.popLastX[i] = -9999;
@@ -392,12 +566,51 @@ export class Hud {
         continue;
       }
 
-      const px = Math.round(_projX);
-      const py = Math.round(_projY);
-      if (px !== this.popLastX[i] || py !== this.popLastY[i]) {
-        this.popLastX[i] = px;
-        this.popLastY[i] = py;
-        el.style.translate = px + 'px ' + py + 'px';
+      if (px < -margin || px > width + margin || py < -margin || py > height + margin) {
+        if (this.popLastX[i] !== -9999) {
+          el.style.translate = PARKED;
+          this.popLastX[i] = -9999;
+          this.popLastY[i] = -9999;
+        }
+        continue;
+      }
+
+      const rx = Math.round(px);
+      const ry = Math.round(py);
+      if (rx !== this.popLastX[i] || ry !== this.popLastY[i]) {
+        this.popLastX[i] = rx;
+        this.popLastY[i] = ry;
+        el.style.translate = rx + 'px ' + ry + 'px';
+      }
+    }
+  }
+
+  /**
+   * The zone-boundary recap. `tone` is 'good' (ON PACE), 'warn' (BEHIND PACE)
+   * or anything else for neutral. Tone is carried by weight and by the rule
+   * under the text, never by hue — the colour monopoly owns green and amber.
+   */
+  zoneBanner(text, tone) {
+    this.elBannerText.textContent = text === undefined || text === null ? '' : text;
+    this.elBanner.className = tone === 'good' ? CLS_BANNER_GOOD
+      : tone === 'warn' ? CLS_BANNER_WARN
+        : CLS_BANNER_INFO;
+    this.bannerOn = true;
+    this.bannerTimer = TUNING.ui.bannerTime;
+  }
+
+  /** Per-frame with unscaled dt. Drives the reel roll and the banner timer. */
+  update(dt) {
+    if (this.weightShown !== this.weightTarget) {
+      this.weightShown = moveTowards(this.weightShown, this.weightTarget, this.weightRate * dt);
+      this._writeWeight();
+    }
+    if (this.bannerOn) {
+      this.bannerTimer -= dt;
+      if (this.bannerTimer <= 0) {
+        this.bannerTimer = 0;
+        this.bannerOn = false;
+        this.elBanner.className = CLS_BANNER;
       }
     }
   }
@@ -407,31 +620,47 @@ export class Hud {
     if (b === this.visible) return;
     this.visible = b;
     this.root.className = b ? CLS_HUD_ON : CLS_HUD;
+    // The counter may have been laid out while hidden; re-measure on the next
+    // popup frame so the flight path lands where the counter actually is.
+    this.anchorW = -1;
   }
 
-  /** Back to a fresh run: instant, no rebuild — this must never feel like a load. */
+  /** Back to a fresh run: instant, no rebuild. This must never feel like a load. */
   reset() {
-    this.massTarget = TUNING.player.startMass;
-    this.massShown = this.massTarget;
-    this.massRate = 0;
-    this.elScale.className = CLS_SCALE;
-    this._writeMass();
+    this.weightTarget = TUNING.player.startWeight;
+    this.weightShown = this.weightTarget;
+    this.weightRate = 0;
+    this.elWeigh.className = CLS_WEIGH;
+    this.targetMet = false;
+    this.elTarget.className = CLS_TARGET;
+    this.elTargetLabel.textContent = TXT_TARGET;
+    this.weightInt = -1;
+    this.weightSig = -1;
+    this._writeWeight();
 
-    this.scoreVal = -1;
-    this.distVal = -1;
-    this.elScore.textContent = '0';
-    this.elDist.textContent = '0';
-    this.scoreVal = 0;
-    this.distVal = 0;
+    this.strikeUsed = -1;
+    this.setStrikes(0, this.strikeMax || TUNING.collision.maxStrikes);
 
-    this.combo = 1;
-    this.comboOn = false;
-    this.comboTimer = 0;
-    this.elCombo.className = CLS_COMBO;
-    this.elComboBody.className = CLS_COMBO_BODY;
-    this.elComboN.textContent = '2';
-    this.comboBarStep = -1;
-    this._writeComboBar(0);
+    this.chain = -1;
+    this.chainShown = -1;
+    this.chainOn = false;
+    this.chainLit = false;
+    this.elChain.className = CLS_CHAIN;
+    this.elChainBody.className = CLS_CHAIN_BODY;
+    this.elChainN.textContent = '0';
+    this.chain = 0;
+
+    this.zoneIndex = -1;
+    this.progStep = -1;
+    this.elRail.style.setProperty('--p', NUM_STR[0]);
+    for (let i = 0; i < this.bandCount; i++) {
+      const finale = i === this.bandCount - 1 && this.bandFinale;
+      this.bandEls[i].className = finale ? CLS_BAND_FINALE : CLS_BAND;
+    }
+
+    this.bannerOn = false;
+    this.bannerTimer = 0;
+    this.elBanner.className = CLS_BANNER;
 
     for (let i = 0; i < this.popCount; i++) {
       if (this.popAlive[i] === 0 && this.popLastX[i] === -9999) continue;
@@ -443,33 +672,141 @@ export class Hud {
       el.style.translate = PARKED;
     }
     this.popCursor = 0;
+    this.anchorW = -1;
+  }
+
+  dispose() {
+    while (this.root.firstChild) this.root.removeChild(this.root.firstChild);
   }
 
   /* ── internals ──────────────────────────────────────────────────────────── */
 
-  _writeComboBar(t01) {
-    let step = (t01 * SCALE_STEPS + 0.5) | 0;
-    if (step < 0) step = 0;
-    else if (step > SCALE_STEPS) step = SCALE_STEPS;
-    if (step === this.comboBarStep) return;
-    this.comboBarStep = step;
-    this.elComboFill.style.transform = SCALE_X[step];
+  _buildPips(max) {
+    const m = Math.max(1, max | 0);
+    while (this.elPips.firstChild) this.elPips.removeChild(this.elPips.firstChild);
+    this.pipEls.length = 0;
+    for (let i = 0; i < m; i++) this.pipEls.push(mk('i', CLS_PIP, this.elPips));
+    this.pipState = new Uint8Array(m);
+    this.pipFlip = new Uint8Array(m);
+    this.strikeMax = m;
+    this.strikeUsed = 0;
   }
 
-  /** Writes only the digits that actually changed. */
-  _writeMass() {
-    const iv = clamp(Math.round(this.massShown), 0, this.massMax);
-    if (iv === this.massInt) return;
-    this.massInt = iv;
+  /**
+   * Lay out the rail's zone bands. Only rebuilt when the shape of the run
+   * changes, which is once per run at most.
+   */
+  _syncBands(zones) {
+    // The common case is the same plan array every frame: an identity check
+    // costs nothing and keeps this whole method off the allocating path.
+    if (zones === this.bandSrc) return;
+
+    let n = 0;
+    let s0 = 0;
+    let s1 = 0;
+    if (typeof zones === 'number') {
+      n = Math.max(1, zones | 0);
+    } else if (zones && zones.length > 0) {
+      n = Math.min(EDGES.length, zones.length | 0);
+      const first = zones[0];
+      const last = zones[n - 1];
+      s0 = typeof first === 'number' ? first
+        : Number(first.dEnd !== undefined ? first.dEnd : first.t) || 0;
+      s1 = typeof last === 'number' ? last
+        : Number(last.dEnd !== undefined ? last.dEnd : last.t) || 0;
+    } else {
+      n = TUNING.weights.zones.length;
+    }
+    // A numeric signature, so a caller that rebuilds its array every frame
+    // still does not rebuild the rail every frame.
+    const sig = n * 1e12 + s0 * 1e5 + s1;
+    if (sig === this.bandSig) { this.bandSrc = zones; return; }
+    this.bandSig = sig;
+    this.bandSrc = zones;
+
+    // Boundary fractions of the rail, 0 at the start line and 1 at the house.
+    const edges = EDGES;
+    if (typeof zones === 'number' || !zones || zones.length === 0) {
+      for (let i = 0; i < n; i++) edges[i] = (i + 1) / (n + 1);
+    } else if (typeof zones[0] === 'number') {
+      let maxV = 0;
+      for (let i = 0; i < n; i++) maxV = Math.max(maxV, zones[i]);
+      const scale = maxV > 1.0001 ? 1 / maxV : 1;
+      for (let i = 0; i < n; i++) edges[i] = clamp01(zones[i] * scale);
+    } else if (zones[0] && zones[0].t !== undefined) {
+      for (let i = 0; i < n; i++) edges[i] = clamp01(zones[i].t);
+    } else {
+      // Plan zones: the finale run-up sits between the last zone and the house,
+      // so the rail's full length is the last zone end plus that run-up.
+      const lastEnd = Number(zones[n - 1].dEnd) || 0;
+      const total = Math.max(1, lastEnd + TUNING.finale.runUpLength);
+      for (let i = 0; i < n; i++) edges[i] = clamp01((Number(zones[i].dEnd) || 0) / total);
+    }
+
+    // One band per zone plus a final band for the run-up to the house.
+    const wantFinale = edges[n - 1] < 0.995;
+    const count = wantFinale ? n + 1 : n;
+    this.bandFinale = wantFinale;
+
+    while (this.elBands.firstChild) this.elBands.removeChild(this.elBands.firstChild);
+    this.bandEls.length = 0;
+    let prev = 0;
+    for (let i = 0; i < count; i++) {
+      const end = i < n ? edges[i] : 1;
+      const el = mk('i', i === count - 1 && wantFinale ? CLS_BAND_FINALE : CLS_BAND, this.elBands);
+      el.style.top = (prev * 100).toFixed(3) + '%';
+      el.style.height = Math.max(0, (end - prev) * 100).toFixed(3) + '%';
+      this.bandEls.push(el);
+      prev = end;
+    }
+    this.bandCount = count;
+    this.zoneIndex = -1;
+  }
+
+  /** The flight target: the centre of the weight window, in CSS pixels. */
+  _measureAnchor(width, height) {
+    this.anchorW = width;
+    this.anchorH = height;
+    const r = this.elWeigh.getBoundingClientRect();
+    if (r.width > 0 || r.height > 0) {
+      this.anchorX = r.left + r.width * 0.5;
+      this.anchorY = r.top + r.height * 0.42;
+    } else {
+      this.anchorX = width * 0.5;
+      this.anchorY = height * 0.10;
+    }
+  }
+
+  /** Restart the counter's punch without touching the reel's contents. */
+  _punch() {
+    this.weighFlip ^= 1;
+    this.elWeigh.className = this.weighFlip ? CLS_WEIGH_UP_A : CLS_WEIGH_UP_B;
+  }
+
+  _writeTargetBar() {
+    const t = this.targetKg > 0 ? this.weightShown / this.targetKg : 0;
+    let step = (clamp01(t) * BAR_STEPS + 0.5) | 0;
+    if (step < 0) step = 0;
+    else if (step > BAR_STEPS) step = BAR_STEPS;
+    if (step === this.targetBarStep) return;
+    this.targetBarStep = step;
+    this.elTargetFill.style.transform = SCALE_X[step];
+  }
+
+  /** Writes only the digits that actually changed — a scale moves one wheel. */
+  _writeWeight() {
+    const iv = clamp(Math.round(this.weightShown), 0, this.weightMax);
+    if (iv === this.weightInt) return;
+    this.weightInt = iv;
 
     let rem = iv;
-    const n = this.massDigits.length;
+    const n = this.weightDigits.length;
     for (let i = 0; i < n; i++) {
       const d = rem % 10;
       rem = (rem - d) / 10;
-      if (this.massDigitVals[i] !== d) {
-        this.massDigitVals[i] = d;
-        this.massDigits[i].textContent = DIGIT_CHARS[d];
+      if (this.weightDigitVals[i] !== d) {
+        this.weightDigitVals[i] = d;
+        this.weightDigits[i].textContent = DIGIT_CHARS[d];
       }
     }
 
@@ -477,22 +814,23 @@ export class Hud {
     let sig = 1;
     let probe = iv;
     while (probe >= 10) { probe = (probe - probe % 10) / 10; sig++; }
-    if (sig !== this.massSig) {
-      this.massSig = sig;
+    if (sig !== this.weightSig) {
+      this.weightSig = sig;
       for (let i = 0; i < n; i++) {
-        this.massDigits[i].className = i < sig ? CLS_DIGIT : CLS_DIGIT_DIM;
+        this.weightDigits[i].className = i < sig ? CLS_DIGIT : CLS_DIGIT_DIM;
       }
-      for (let i = 0; i < this.massSeps.length; i++) {
-        this.massSeps[i].className = sig > this.massSepPower[i] ? CLS_SEP : CLS_SEP_DIM;
+      for (let i = 0; i < this.weightSeps.length; i++) {
+        this.weightSeps[i].className = sig > this.weightSepPower[i] ? CLS_SEP : CLS_SEP_DIM;
       }
     }
 
-    // Truncate, never round. This sits directly beside the kilogram reel, and a
-    // scale that reads 999 KG next to "1.0 T" is a scale nobody trusts.
-    const t10 = Math.floor(iv / 100);
-    if (t10 !== this.tonnes10) {
-      this.tonnes10 = t10;
-      this.elTonnes.textContent = (t10 / 10).toFixed(1) + ' T';
+    this._writeTargetBar();
+
+    const met = this.targetKg > 0 && iv >= this.targetKg;
+    if (met !== this.targetMet) {
+      this.targetMet = met;
+      this.elTarget.className = met ? CLS_TARGET_MET : CLS_TARGET;
+      this.elTargetLabel.textContent = met ? TXT_TARGET_MET : TXT_TARGET;
     }
   }
 }

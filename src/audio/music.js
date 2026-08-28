@@ -7,10 +7,25 @@
  * clock. It is NEVER driven from the animation frame, so frame hitches, hitstop
  * and slow-motion cannot make the music stutter.
  *
- * Layers gate on combo intensity:
- *   0 drums (always)  1 bass  2 mid arp  3 lead pad
- * `setBlocked(true)` strips everything but the drums in 100 ms — the music
- * falling away is half of what makes hitting a barrier feel like a mistake.
+ * THE ZONE IS THE ARRANGEMENT. There are six instrument layers and six zones,
+ * and each zone boundary hands you the next one:
+ *
+ *   zone 0 RESIDENTIAL  drums                    (500 kg — you are nothing yet)
+ *   zone 1 MARKET       + bass
+ *   zone 2 HIGH STREET  + arp
+ *   zone 3 TRAFFIC      + pad
+ *   zone 4 FREIGHT YARD + stab      (off-beat organ hits)
+ *   zone 5 INDUSTRIAL   + lead      (a detuned siren over the top)
+ *
+ * The tempo also climbs `musicBpmPerZone` per zone, so the ramp genuinely
+ * accelerates. A hot chain can lend ONE layer early (`musicChainBonusAt`) and
+ * `musicLayerThresholds` lets intensity open a layer ahead of its zone, so
+ * playing well is audible inside a zone as well as between zones.
+ *
+ * `setStripped(true)` — a block, or the player stopped — takes everything but
+ * the drums away in `musicBlockedFade` seconds. The music falling out from
+ * under you is half of what makes hitting something too heavy feel like a
+ * mistake, and it is the first thing you notice when you stall.
  */
 
 import { TUNING } from '../tuning.js';
@@ -26,6 +41,8 @@ const SNARE = [0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0];
 const HAT   = [1, 0, 1, 1, 1, 0, 1, 0, 1, 0, 1, 1, 1, 0, 1, 1];
 const BASS  = [1, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 0];
 const ARP   = [1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1];
+const STAB  = [0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0];
+const LEAD  = [1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 1];
 
 /** i - VI - III - VII in A minor. */
 const ROOTS = [0, -4, 3, -2];
@@ -33,12 +50,16 @@ const IS_MINOR = [1, 0, 0, 0];
 const MINOR_TONES = [0, 3, 7, 12, 15];
 const MAJOR_TONES = [0, 4, 7, 12, 16];
 const ARP_SEQ = [0, 1, 2, 3, 4, 3, 2, 1];
+const LEAD_SEQ = [12, 15, 19, 24];
 
 const BASS_HZ = 55;    // A1
 const PAD_HZ = 110;    // A2
+const STAB_HZ = 220;   // A3
 const ARP_HZ = 440;    // A4
+const LEAD_HZ = 440;   // A4
 
-const L_DRUMS = 0, L_BASS = 1, L_ARP = 2, L_PAD = 3;
+const L_DRUMS = 0, L_BASS = 1, L_ARP = 2, L_PAD = 3, L_STAB = 4, L_LEAD = 5;
+const LAYERS = 6;
 
 function semiToHz(base, semi) {
   return base * Math.pow(2, semi / 12);
@@ -63,17 +84,18 @@ export class MusicSystem {
 
     this.mix = null;
     this.filter = null;
-    this.layers = null;      // GainNode[4]
+    this.layers = null;      // GainNode[6]
 
     this.intensity = 0;
-    this.blocked = false;
+    this.zone = 0;
+    this.stripped = false;
     this.filterAmount = 0;
 
     this._step = 0;
     this._next = 0;
     this._timer = 0;
-    this._target = new Float64Array(4);
-    this._lastOn = new Float64Array(4);
+    this._target = new Float64Array(LAYERS);
+    this._lastOn = new Float64Array(LAYERS);
     this._tickBound = this._tick.bind(this);
   }
 
@@ -94,10 +116,11 @@ export class MusicSystem {
     mix.connect(filter);
     this.mix = mix;
 
-    this.layers = new Array(4);
-    for (let i = 0; i < 4; i++) {
+    const mixv = TUNING.audio.musicLayerMix;
+    this.layers = new Array(LAYERS);
+    for (let i = 0; i < LAYERS; i++) {
       const g = ctx.createGain();
-      g.gain.value = i === L_DRUMS ? TUNING.audio.musicLayerMix[0] : 0;
+      g.gain.value = i === L_DRUMS ? (mixv[0] || 0.9) : 0;
       g.connect(mix);
       this.layers[i] = g;
     }
@@ -152,11 +175,28 @@ export class MusicSystem {
     this._applyLayers();
   }
 
-  setBlocked(b) {
-    const v = !!b;
-    if (v === this.blocked) return;
-    this.blocked = v;
+  /** The zone index unlocks layer `zone`. Idempotent — pushed every frame. */
+  setZone(index) {
+    const z = clamp(Math.floor(index || 0), 0, LAYERS - 1);
+    if (z === this.zone) return;
+    this.zone = z;
     this._applyLayers();
+  }
+
+  /**
+   * Strip back to drums. True while the player has just been blocked or has
+   * stopped moving; `AudioSystem.update` drives the "stopped" half of it.
+   */
+  setStripped(b) {
+    const v = !!b;
+    if (v === this.stripped) return;
+    this.stripped = v;
+    this._applyLayers();
+  }
+
+  /** Kept for API stability — a block is one reason to strip. */
+  setBlocked(b) {
+    this.setStripped(b);
   }
 
   /** 0 = open, 1 = heavily filtered (slow-motion). */
@@ -185,18 +225,31 @@ export class MusicSystem {
     const A = TUNING.audio;
     const th = A.musicLayerThresholds;
     const mixv = A.musicLayerMix;
-    const width = A.musicLayerWidth > 0.001 ? A.musicLayerWidth : 0.15;
+    const width = A.musicLayerWidth > 0.001 ? A.musicLayerWidth : 0.16;
     const t = this.engine.now;
-    const tc = (this.blocked ? A.musicBlockedFade : A.musicLayerFade) / 3;
-    for (let i = 0; i < 4; i++) {
+    const tc = (this.stripped ? A.musicBlockedFade : A.musicLayerFade) / 3;
+
+    // A hot chain lends exactly one layer above the zone — enough to hear that
+    // you are doing well, never enough to skip the arrangement.
+    const bonus = this.intensity >= A.musicChainBonusAt ? 1 : 0;
+    const unlocked = this.zone + bonus;
+
+    for (let i = 0; i < LAYERS; i++) {
       let v;
-      if (i === L_DRUMS) v = 1;
-      else if (this.blocked) v = 0;
-      else v = clamp01((this.intensity - th[i]) / width);
+      if (i === L_DRUMS) {
+        v = 1;
+      } else if (this.stripped) {
+        v = 0;
+      } else {
+        // the zone opens the layer outright; intensity can crossfade it in early
+        const byZone = i <= unlocked ? 1 : 0;
+        const byIntensity = (th && i < th.length) ? clamp01((this.intensity - th[i]) / width) : 0;
+        v = byZone > byIntensity ? byZone : byIntensity;
+      }
       this._target[i] = v;
-      if (v > 0.001) this._lastOn[i] = this.engine.now;
+      if (v > 0.001) this._lastOn[i] = t;
       try {
-        this.layers[i].gain.setTargetAtTime(v * mixv[i], t, tc);
+        this.layers[i].gain.setTargetAtTime(v * (mixv[i] !== undefined ? mixv[i] : 0.4), t, tc);
       } catch (e) { /* noop */ }
     }
   }
@@ -215,7 +268,11 @@ export class MusicSystem {
     if (ctx.state !== 'running') return;   // never run ahead of a paused clock
 
     const A = TUNING.audio;
-    const stepDur = 15 / (A.musicBpm > 20 ? A.musicBpm : 20);  // 60/bpm/4
+    // Tempo climbs with the zone. Recomputed per tick rather than per note, so a
+    // zone change speeds the loop up from the next scheduled step onward without
+    // ever rewriting anything already on the audio clock.
+    const bpm = (A.musicBpm > 20 ? A.musicBpm : 120) + A.musicBpmPerZone * this.zone;
+    const stepDur = 15 / bpm;   // 60/bpm/4
     const now = ctx.currentTime;
     const horizon = now + A.musicLookahead;
 
@@ -257,6 +314,20 @@ export class MusicSystem {
     // ── pad (one chord per bar)
     if (this._live(L_PAD) && s === 0) {
       this._pad(t, stepDur * STEPS_PER_BAR, bar);
+    }
+
+    // ── stab: off-beat organ hits, zone 4. This is the layer that turns the
+    //    loop from "driving" into "industrial".
+    if (this._live(L_STAB) && STAB[s]) {
+      const tones = IS_MINOR[bar] ? MINOR_TONES : MAJOR_TONES;
+      this._stab(t, ROOTS[bar], tones, stepDur * 1.2);
+    }
+
+    // ── lead: zone 5, the last thing you earn
+    if (this._live(L_LEAD) && LEAD[s]) {
+      const tones = IS_MINOR[bar] ? MINOR_TONES : MAJOR_TONES;
+      const li = LEAD_SEQ[(step >> 2) % LEAD_SEQ.length];
+      this._lead(t, semiToHz(LEAD_HZ, ROOTS[bar] + tones[bar % tones.length] + li - 12), stepDur * 3.4);
     }
   }
 
@@ -412,6 +483,66 @@ export class MusicSystem {
     }
   }
 
+  /** Zone 4: a short, hard, band-limited organ chord on the off-beats. */
+  _stab(t, root, tones, dur) {
+    const ctx = this.engine.ctx;
+    const out = this.layers[L_STAB];
+    const f = ctx.createBiquadFilter();
+    f.type = 'bandpass';
+    f.Q.value = 1.1;
+    f.frequency.setValueAtTime(1500, t);
+    f.frequency.exponentialRampToValueAtTime(620, t + dur * 0.8);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.34, t + 0.004);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    f.connect(g);
+    g.connect(out);
+
+    for (let i = 0; i < 3; i++) {
+      const o = ctx.createOscillator();
+      o.type = i === 0 ? 'square' : 'sawtooth';
+      o.frequency.value = semiToHz(STAB_HZ, root + tones[i]);
+      o.detune.value = (i - 1) * 6;
+      o.connect(f);
+      if (i === 2) { o._m1 = f; o._m2 = g; }
+      o.onended = freeNote;
+      o.start(t);
+      o.stop(t + dur + 0.05);
+    }
+  }
+
+  /** Zone 5: a detuned two-oscillator siren riding over everything. */
+  _lead(t, freq, dur) {
+    const ctx = this.engine.ctx;
+    const out = this.layers[L_LEAD];
+    const f = ctx.createBiquadFilter();
+    f.type = 'lowpass';
+    f.Q.value = 5;
+    f.frequency.setValueAtTime(Math.min(7000, freq * 5), t);
+    f.frequency.exponentialRampToValueAtTime(Math.max(260, freq * 1.4), t + dur * 0.9);
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.26, t + 0.02);
+    g.gain.setValueAtTime(0.26, t + dur * 0.55);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    f.connect(g);
+    g.connect(out);
+
+    for (let i = 0; i < 2; i++) {
+      const o = ctx.createOscillator();
+      o.type = 'sawtooth';
+      o.frequency.setValueAtTime(freq * (i === 0 ? 0.995 : 1), t);
+      o.frequency.linearRampToValueAtTime(freq, t + dur * 0.4);
+      o.detune.value = i === 0 ? -11 : 11;
+      o.connect(f);
+      if (i === 1) { o._m1 = f; o._m2 = g; }
+      o.onended = freeNote;
+      o.start(t);
+      o.stop(t + dur + 0.08);
+    }
+  }
+
   _noise(t, dur, gain, type, freq, q, out) {
     const ctx = this.engine.ctx;
     if (!this.noise) return;
@@ -440,7 +571,8 @@ export class MusicSystem {
   reset() {
     this._stop();
     this.intensity = 0;
-    this.blocked = false;
+    this.zone = 0;
+    this.stripped = false;
     this.filterAmount = 0;
     this._step = 0;
     if (!this.ready) return;
@@ -453,7 +585,7 @@ export class MusicSystem {
     if (this._timer) { clearInterval(this._timer); this._timer = 0; }
     if (!this.ready) return;
     this.ready = false;
-    for (let i = 0; i < 4; i++) {
+    for (let i = 0; i < LAYERS; i++) {
       try { this.layers[i].disconnect(); } catch (e) { /* noop */ }
     }
     try { this.mix.disconnect(); } catch (e) { /* noop */ }

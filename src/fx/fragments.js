@@ -305,9 +305,18 @@ export class FragmentSystem {
       const f = falloff / (falloff + dist);
       const push = impulse * (0.45 + f);
 
-      this.vx[i] = dx * push + vx * velShare + fxRng.spread(jitter);
+      // Debris must never obscure what is coming (§6.1). The chase camera always
+      // sits behind the roller at +Z, so "away from the viewer" is -Z: bias the
+      // throw outward and down-hill, then hard-clamp any residual velocity that
+      // would carry a fragment back toward the lens. A satisfying explosion that
+      // hides the next formation is a bug.
+      const lateral = D.lateralBias;
+      const away = D.cameraAwayBias;
+      this.vx[i] = dx * push * (1 + lateral) + vx * velShare + fxRng.spread(jitter);
       this.vy[i] = dy * push + vy * velShare + up + fxRng.spread(jitter * 0.5);
-      this.vz[i] = dz * push + vz * velShare + fxRng.spread(jitter);
+      let vzi = dz * push + vz * velShare - away + fxRng.spread(jitter);
+      if (vzi > D.maxTowardCamera) vzi = D.maxTowardCamera;
+      this.vz[i] = vzi;
 
       this.qx[i] = ox; this.qy[i] = oy; this.qz[i] = oz; this.qw[i] = ow;
       this.wx[i] = fxRng.spread(spin);

@@ -47,16 +47,19 @@ export function resetParams(p) {
 }
 
 /**
- * 0..1 "how heavy are we" term, logarithmic between startMass and maxMass.
+ * 0..1 "how heavy are we" term, logarithmic between startWeight and maxWeight.
  * Used by every layer that has to make growth audible.
+ *
+ * Logarithmic because the run spans 500 kg to 140 t: linear would leave the whole
+ * first three zones inside the bottom 2 % of the scale and inaudible.
  */
-export function massTerm01(mass) {
-  const start = TUNING.player.startMass;
-  const max = TUNING.player.maxMass;
-  const mr = (mass > 0 ? mass : start) / start;
-  if (mr <= 1) return 0;
+export function weightTerm01(weight) {
+  const start = TUNING.player.startWeight;
+  const max = TUNING.player.maxWeight;
+  const wr = (weight > 0 ? weight : start) / start;
+  if (wr <= 1) return 0;
   const span = Math.log2(max / start);
-  return clamp01(Math.log2(mr) / (span > 0 ? span : 1));
+  return clamp01(Math.log2(wr) / (span > 0 ? span : 1));
 }
 
 /** Shared `ended` handler — a module-level function so no closure is allocated. */
