@@ -70,6 +70,7 @@ export class TrackProfile {
 
 export const ROAD_HALF = TUNING.world.roadWidth / 2;
 export const LANE_WIDTH = TUNING.world.laneWidth;
+export const LANE_COUNT = TUNING.world.laneCount;
 
 export function laneX(lane) {
   const n = TUNING.world.laneCount;
@@ -81,4 +82,31 @@ export function laneAt(x) {
   const n = TUNING.world.laneCount;
   const i = Math.floor((x + ROAD_HALF) / TUNING.world.laneWidth);
   return i < 0 ? 0 : i >= n ? n - 1 : i;
+}
+
+/** Left edge x of a lane. */
+export function laneLeft(lane) { return laneX(lane) - TUNING.world.laneWidth * 0.5; }
+/** Right edge x of a lane. */
+export function laneRight(lane) { return laneX(lane) + TUNING.world.laneWidth * 0.5; }
+
+/**
+ * Is x inside the inclusive lane span [from, to]?
+ *
+ * Holes and §8's narrows are both authored as lane spans and both have to answer
+ * "is there road under this point", so the arithmetic lives here once rather than
+ * being rewritten in the streamer, the winnability proof and the road builder.
+ */
+export function inLaneSpan(x, from, to) {
+  return x > laneLeft(from) && x < laneRight(to);
+}
+
+/**
+ * The grade bound from §6.1: the highway never levels out and never climbs, so
+ * every segment the generator emits is clamped into [minSlopeDeg, maxSlopeDeg]
+ * before it reaches the profile. Clamping rather than asserting because the only
+ * thing worse than an out-of-range grade is a track that fails to build.
+ */
+export function clampSlopeDeg(deg) {
+  const W = TUNING.world;
+  return deg < W.minSlopeDeg ? W.minSlopeDeg : deg > W.maxSlopeDeg ? W.maxSlopeDeg : deg;
 }

@@ -7,16 +7,21 @@
  *
  * Graph:
  *
- *   voices ─┬─► sfxGain  ─┐
- *           ├─► uiGain   ─┼─► masterGain ─► limiter ─► destination
- *   music ──► musicDuck ─► musicGain ─┘
+ *   voices ──► sfxGain ─► sfxTone ─┬──────────────────────┐
+ *                                  └─► send ─► conv ─► wet ┤
+ *   ui ──────► uiGain ────────────────────────────────────┼─► masterGain ─► limiter ─► destination
+ *   music ───► musicDuck ─► musicGain ────────────────────┘
  *
  * The limiter is a DynamicsCompressorNode with a 20:1 ratio and a hard knee, so
  * a 30-object pulverize glues into one big event instead of clipping.
+ *
+ * `sfxTone` is a lowpass that sits wide open all run and the convolution send is
+ * silent, until §17's `setTunnel()` opens one and closes the other: inside a
+ * tunnel every smash, and the roll itself, arrives off concrete.
  */
 
 import { TUNING } from '../tuning.js';
-import { clamp, clamp01, dbToGain } from '../core/math.js';
+import { clamp, clamp01, damp, dbToGain, lerp } from '../core/math.js';
 import { Pool } from '../core/pool.js';
 
 /** Shape of the reusable play-parameter block handed to `AudioEngine.play`. */
@@ -106,10 +111,18 @@ export class AudioEngine {
     this.masterGain = null;
     this.limiter = null;
     this.sfxIn = null;
+    this.sfxTone = null;   // the sfx bus's own lowpass — open, until a tunnel closes it
     this.musicIn = null;   // music sources connect here (pre-duck)
     this.musicDuck = null;
     this.musicGain = null;
     this.uiIn = null;
+
+    // ── §17 tunnel send. Built lazily by `buildTunnel()` once the IR exists.
+    this.convolver = null;
+    this.tunnelSend = null;
+    this.tunnelWet = null;
+    this._tunnelTarget = 0;
+    this._tunnel = 0;
 
     this.voicePool = null;
     this._hasPanner = false;
@@ -157,8 +170,21 @@ export class AudioEngine {
 
     const sfx = ctx.createGain();
     sfx.gain.value = TUNING.audio.sfxGain;
-    sfx.connect(master);
     this.sfxIn = sfx;
+
+    // Everything on the sfx bus passes through one lowpass so a tunnel has
+    // something to close. It sits wide open (`tunnelDryHz` at 20 kHz) the rest
+    // of the run, which is transparent, and it is the only node the tunnel
+    // needs on the dry path — the wet path hangs off it in `buildTunnel`.
+    const tone = ctx.createBiquadFilter();
+    tone.type = 'lowpass';
+    // Guarded because this one is on the boot path: a missing tuning key here
+    // would throw inside init() and take the whole audio system down silently.
+    tone.frequency.value = TUNING.audio.tunnelDryHz > 0 ? TUNING.audio.tunnelDryHz : 20000;
+    tone.Q.value = 0.7;
+    sfx.connect(tone);
+    tone.connect(master);
+    this.sfxTone = tone;
 
     const music = ctx.createGain();
     music.gain.value = TUNING.audio.musicGain;
@@ -263,6 +289,73 @@ export class AudioEngine {
       p.linearRampToValueAtTime(target < cur ? target : cur * 0.999, t + a);
       p.setValueAtTime(target < cur ? target : cur * 0.999, t + a + hold);
       p.linearRampToValueAtTime(1, t + a + hold + r);
+    } catch (e) { /* dead node */ }
+  }
+
+  // ──────────────────────────────────────────────────────────── §17 tunnel
+
+  /**
+   * Hang a convolution send off the sfx bus. Called once at boot with an IR
+   * from `makeReverbIr`. If the platform has no ConvolverNode the send is
+   * simply never built and `setTunnel` falls back to the dry lowpass alone,
+   * which still reads as "you are inside something".
+   */
+  buildTunnel(ir) {
+    if (!this.ready || this.convolver || !ir) return false;
+    const ctx = this.ctx;
+    if (typeof ctx.createConvolver !== 'function') return false;
+    try {
+      const conv = ctx.createConvolver();
+      conv.normalize = false;
+      conv.buffer = ir;
+      const send = ctx.createGain();
+      send.gain.value = 0;
+      const wet = ctx.createGain();
+      wet.gain.value = TUNING.audio.tunnelWetGain;
+      this.sfxTone.connect(send);
+      send.connect(conv);
+      conv.connect(wet);
+      wet.connect(this.masterGain);
+      this.convolver = conv;
+      this.tunnelSend = send;
+      this.tunnelWet = wet;
+      return true;
+    } catch (e) {
+      this.convolver = null;
+      this.tunnelSend = null;
+      this.tunnelWet = null;
+      return false;
+    }
+  }
+
+  /**
+   * 0 = open road, 1 = fully inside the tunnel. Smoothed in `update()` rather
+   * than ramped here, because the game pushes this every frame as the roller
+   * crosses the portal and scheduling a ramp per frame would stack automation.
+   */
+  setTunnel(inside01) {
+    this._tunnelTarget = clamp01(inside01);
+  }
+
+  _updateTunnel(dt) {
+    const A = TUNING.audio;
+    const prev = this._tunnel;
+    let t = damp(prev, this._tunnelTarget, A.tunnelSmoothing > 0 ? A.tunnelSmoothing : 0.14, dt);
+    // Snap the last thousandth: an exponential approach never actually arrives,
+    // and a send that settles at 0.0004 instead of 0 would keep writing a param
+    // every frame for the rest of the run.
+    const d = t - this._tunnelTarget;
+    if (d < 0.0005 && d > -0.0005) t = this._tunnelTarget;
+    this._tunnel = t;
+    // On the open road this is one compare per frame and no AudioParam traffic.
+    if (t === prev) return;
+    if (this.tunnelSend) {
+      try { this.tunnelSend.gain.value = A.tunnelSendGain * t; } catch (e) { /* dead node */ }
+    }
+    try {
+      this.sfxTone.frequency.value = lerp(
+        A.tunnelDryHz > 0 ? A.tunnelDryHz : 20000,
+        A.tunnelToneHz > 0 ? A.tunnelToneHz : 5200, t);
     } catch (e) { /* dead node */ }
   }
 
@@ -482,6 +575,7 @@ export class AudioEngine {
    */
   update(dt) {
     if (!this.ready) return;
+    this._updateTunnel(dt > 0 ? dt : 0);
     this._sweepAccum += dt;
     if (this._sweepAccum < 0.25) return;
     this._sweepAccum = 0;
@@ -522,12 +616,20 @@ export class AudioEngine {
     try { this.masterGain.disconnect(); } catch (e) { /* noop */ }
     try { this.limiter.disconnect(); } catch (e) { /* noop */ }
     try { this.sfxIn.disconnect(); } catch (e) { /* noop */ }
+    if (this.sfxTone) { try { this.sfxTone.disconnect(); } catch (e) { /* noop */ } }
+    if (this.tunnelSend) { try { this.tunnelSend.disconnect(); } catch (e) { /* noop */ } }
+    if (this.convolver) { try { this.convolver.disconnect(); } catch (e) { /* noop */ } }
+    if (this.tunnelWet) { try { this.tunnelWet.disconnect(); } catch (e) { /* noop */ } }
     try { this.musicGain.disconnect(); } catch (e) { /* noop */ }
     try { this.musicDuck.disconnect(); } catch (e) { /* noop */ }
     try { this.uiIn.disconnect(); } catch (e) { /* noop */ }
     if (ctx && typeof ctx.close === 'function' && ctx.state !== 'closed') {
       try { ctx.close(); } catch (e) { /* noop */ }
     }
+    this.sfxTone = null;
+    this.convolver = null;
+    this.tunnelSend = null;
+    this.tunnelWet = null;
     this.ctx = null;
   }
 }

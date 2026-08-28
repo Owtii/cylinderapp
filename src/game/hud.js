@@ -25,6 +25,18 @@
  * load. The one unavoidable exception is the popup's `translate` string, which
  * the DOM only accepts as text — and that is written only when the rounded
  * pixel position actually changed, so a still frame allocates nothing at all.
+ *
+ * v3 adds three transient beats and one hook, and nothing permanent:
+ *
+ *   zoneRecap()   the §16.4 boundary banner — ZONE 3 CLEARED · +6,200 KG · ON PACE
+ *   stampTier()   the on-screen half of §17's first taste: the tier name, ~0.5 s
+ *   flashEdge()   a frame-edge pulse — the paper tier's reward, which must cost
+ *                 the player nothing (no hitstop, no speed, no layout read)
+ *   setDim()      fades the chrome for the scale reveal, which is a camera move
+ *
+ * The stamp and the edge flash deliberately sit OUTSIDE the dimmable chrome
+ * wrapper: they are beats, not furniture, and a beat that fires during a scale
+ * reveal still has to land.
  */
 
 import { TUNING } from '../tuning.js';
@@ -50,6 +62,21 @@ const EDGES = new Float64Array(64);
 const BAR_STEPS = 100;
 const SCALE_X = new Array(BAR_STEPS + 1);
 for (let i = 0; i <= BAR_STEPS; i++) SCALE_X[i] = 'scaleX(' + (i / BAR_STEPS) + ')';
+
+/** Pre-built 0.00 .. 1.00 fractions, for the chrome-fade custom property. */
+const FRAC_STEPS = 100;
+const FRAC_STR = new Array(FRAC_STEPS + 1);
+for (let i = 0; i <= FRAC_STEPS; i++) FRAC_STR[i] = (i / FRAC_STEPS).toFixed(2);
+
+/** Pre-built recap headlines. A zone boundary must not build a string. */
+const ZONE_CLEARED = new Array(17);
+for (let i = 0; i < ZONE_CLEARED.length; i++) ZONE_CLEARED[i] = 'ZONE ' + i + ' CLEARED';
+
+/* Used only when the integrator has not added `ui.dimTime`; see `update()`. */
+const DIM_TIME_FALLBACK = 0.22;
+
+const TXT_ON_PACE = 'ON PACE';
+const TXT_BEHIND_PACE = 'BEHIND PACE';
 
 /** Where a popup goes when it is off-screen or dead. */
 const PARKED = '-9999px -9999px';
@@ -97,6 +124,16 @@ const CLS_BANNER = 'banner';
 const CLS_BANNER_GOOD = 'banner on good';
 const CLS_BANNER_WARN = 'banner on warn';
 const CLS_BANNER_INFO = 'banner on info';
+const CLS_BANNER_ROW = 'banner-row';
+const CLS_BANNER_ROW_OFF = 'banner-row off';
+
+const CLS_STAMP = 'stamp';
+const CLS_STAMP_A = 'stamp on a';
+const CLS_STAMP_B = 'stamp on b';
+
+const CLS_EDGE = 'edge';
+const CLS_EDGE_A = 'edge on a';
+const CLS_EDGE_B = 'edge on b';
 
 const TXT_TARGET = 'TARGET';
 const TXT_TARGET_MET = 'TARGET MET';
@@ -182,6 +219,73 @@ function mk(tag, cls, parent, text) {
   return e;
 }
 
+/* ─────────────────────────────────────────────────────── haptics (§16.12) ── */
+/*
+ * `navigator.vibrate` is absent on every iOS browser and throws inside some
+ * embedded webviews, so it is probed once, lazily, and switched off for good the
+ * first time it misbehaves. Nothing here allocates and nothing here reads the
+ * DOM: a smash must never cost the player a millisecond.
+ */
+
+let _hapticsOn = true;
+let _hapticsProbe = -1;                 // -1 unprobed, 0 unavailable, 1 live
+let _hapticLastMs = -1e9;
+
+function hapticsProbe() {
+  if (_hapticsProbe >= 0) return _hapticsProbe;
+  _hapticsProbe = 0;
+  try {
+    if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') _hapticsProbe = 1;
+  } catch (err) { /* accessing navigator throws in some sandboxes */ }
+  return _hapticsProbe;
+}
+
+/** True when this device can actually buzz — the settings row hides otherwise. */
+export function hapticsSupported() {
+  return hapticsProbe() === 1;
+}
+
+/** The settings toggle. Off is remembered here, not in the device. */
+export function setHapticsEnabled(v) {
+  _hapticsOn = !!v;
+}
+
+export function hapticsEnabled() {
+  return _hapticsOn;
+}
+
+/**
+ * `kind` is a key in `TUNING.ui.haptics` — 'smash' is a light tap, 'block' a
+ * heavy buzz, 'house' a long rumble. Returns true only if the device was
+ * actually asked to vibrate.
+ *
+ * Taps (a plain number of milliseconds) are rate-limited: above ~6 smashes per
+ * second the paper tier would otherwise hold the motor open continuously, which
+ * reads as a fault rather than as feedback. Patterns (arrays) are the rare,
+ * loud events and always fire.
+ */
+export function haptic(kind) {
+  if (!_hapticsOn || hapticsProbe() !== 1) return false;
+  const table = TUNING.ui.haptics;
+  const pat = table ? table[kind] : undefined;
+  if (pat === undefined || pat === null) return false;
+
+  const now = Date.now();
+  if (typeof pat === 'number') {
+    if (pat <= 0) return false;
+    if (now - _hapticLastMs < TUNING.ui.hapticMinGap * 1000) return false;
+  }
+  _hapticLastMs = now;
+
+  try {
+    navigator.vibrate(pat);
+  } catch (err) {
+    _hapticsProbe = 0;                  // a throwing vibrator is never asked twice
+    return false;
+  }
+  return true;
+}
+
 /* ────────────────────────────────────────────────────────────────────── HUD ── */
 
 export class Hud {
@@ -206,15 +310,26 @@ export class Hud {
     st.setProperty('--target-pulse', U.targetPulseTime + 's');
     st.setProperty('--pop-life', U.popupLife + 's');
     st.setProperty('--banner-fade', U.bannerFade + 's');
+    st.setProperty('--stamp-life', U.stampTime + 's');
+    st.setProperty('--edge-life', U.edgeFlashTime + 's');
+    st.setProperty('--chrome', FRAC_STR[FRAC_STEPS]);
+
+    /* ── the dimmable chrome ───────────────────────────────────────────────
+       Everything that is furniture hangs off this one wrapper, so §17's scale
+       reveal can fade the whole HUD by writing a single custom property. It has
+       to be `position:absolute; inset:0` because every child inside positions
+       itself against the nearest positioned ancestor. */
+    const chrome = mk('div', 'hud-chrome', root);
+    this.elChrome = chrome;
 
     /* ── label layer ───────────────────────────────────────────────────────
        Owned by MODULE A's LabelSystem; it lives underneath the HUD furniture so
        a label can never sit on top of the weight counter. Handed over by
        `hud.labelRoot`. */
-    this.labelLayer = mk('div', 'hud-labels', root);
+    this.labelLayer = mk('div', 'hud-labels', chrome);
 
     /* ── top-left: strikes, then chain ─────────────────────────────────────── */
-    const tl = mk('div', 'hud-zone hud-tl', root);
+    const tl = mk('div', 'hud-zone hud-tl', chrome);
 
     const strikeBox = mk('div', 'strikes', tl);
     this.elPips = mk('div', 'pips', strikeBox);
@@ -233,7 +348,7 @@ export class Hud {
     mk('span', 'chain-tag', this.elChainBody, 'CHAIN');
 
     /* ── top-centre: the weight counter (the star) ─────────────────────────── */
-    const tc = mk('div', 'hud-zone hud-tc', root);
+    const tc = mk('div', 'hud-zone hud-tc', chrome);
     this.elWeigh = mk('div', CLS_WEIGH, tc);
 
     const win = mk('div', 'weigh-window', this.elWeigh);
@@ -257,6 +372,11 @@ export class Hud {
     // The target lives welded to the underside of the counter — the player must
     // never have to remember what they are building toward.
     this.elTarget = mk('div', CLS_TARGET, this.elWeigh);
+    // Endless mode's lap and the daily's number ride on the target line rather
+    // than taking a corner of their own — the HUD gains no new furniture in v3.
+    this.elRunTag = mk('span', 'tgt-tag', this.elTarget, '');
+    this.elRunTag.hidden = true;
+    this.runTag = '';
     this.elTargetLabel = mk('span', 'tgt-k', this.elTarget, TXT_TARGET);
     this.elTargetValue = mk('span', 'tgt-v', this.elTarget, '0');
     mk('span', 'tgt-u', this.elTarget, 'KG');
@@ -265,7 +385,7 @@ export class Hud {
     this.elTargetFill = mk('i', 'tgt-fill', tgTrack);
 
     /* ── right edge: the progress rail ─────────────────────────────────────── */
-    const rail = mk('div', 'hud-prog', root);
+    const rail = mk('div', 'hud-prog', chrome);
     this.elRail = mk('div', 'prog-rail', rail);
     this.elBands = mk('div', 'prog-bands', this.elRail);
     this.elProgFill = mk('i', 'prog-fill', this.elRail);
@@ -281,13 +401,20 @@ export class Hud {
     this.elRail.style.setProperty('--p', NUM_STR[0]);
 
     /* ── zone recap banner (transient, centre-top) ─────────────────────────── */
-    this.elBanner = mk('div', CLS_BANNER, root);
+    this.elBanner = mk('div', CLS_BANNER, chrome);
     this.elBannerText = mk('div', 'banner-text', this.elBanner, '');
+    // §16.4's second line: what the zone paid, and the pace verdict. The verdict
+    // is a WORD first — its colour is a muted amber-grey that could not be read
+    // as an outline amber at the edge of vision, and it is legible with the
+    // saturation at zero.
+    this.elBannerRow = mk('div', CLS_BANNER_ROW_OFF, this.elBanner);
+    this.elBannerDelta = mk('span', 'banner-delta', this.elBannerRow, '');
+    this.elBannerVerdict = mk('span', 'banner-verdict', this.elBannerRow, '');
     this.bannerTimer = 0;
     this.bannerOn = false;
 
     /* ── popup pool ────────────────────────────────────────────────────────── */
-    this.elPopups = mk('div', 'hud-popups', root);
+    this.elPopups = mk('div', 'hud-popups', chrome);
     const pc = Math.max(1, U.popupCount | 0);
     this.popCount = pc;
     this.popEls = new Array(pc);
@@ -311,6 +438,16 @@ export class Hud {
     this.popCursor = 0;
     this.popSeed = 1;
 
+    /* ── beats, outside the chrome so a scale reveal cannot dim them ───────── */
+    this.elStamp = mk('div', CLS_STAMP, root);
+    this.elStampText = mk('div', 'stamp-text', this.elStamp, '');
+    this.elStampSub = mk('div', 'stamp-sub', this.elStamp, '');
+    this.stampFlip = 0;
+    this.stampTimer = 0;
+
+    this.elEdge = mk('div', CLS_EDGE, root);
+    this.edgeFlip = 0;
+
     // Where popups fly to: the middle of the weight window, in CSS pixels.
     this.anchorX = 0;
     this.anchorY = 0;
@@ -333,6 +470,10 @@ export class Hud {
     this.chainLit = false;
     this.chainOn = false;
     this.chainFlip = 0;
+
+    this.dimNow = 0;
+    this.dimHold = 0;
+    this.dimStep = FRAC_STEPS;
 
     this.visible = false;
 
@@ -592,11 +733,95 @@ export class Hud {
    */
   zoneBanner(text, tone) {
     this.elBannerText.textContent = text === undefined || text === null ? '' : text;
+    if (this.elBannerRow.className !== CLS_BANNER_ROW_OFF) {
+      this.elBannerRow.className = CLS_BANNER_ROW_OFF;
+    }
     this.elBanner.className = tone === 'good' ? CLS_BANNER_GOOD
       : tone === 'warn' ? CLS_BANNER_WARN
         : CLS_BANNER_INFO;
     this.bannerOn = true;
     this.bannerTimer = TUNING.ui.bannerTime;
+  }
+
+  /**
+   * §16.4's recap beat, composed rather than handed a sentence:
+   *
+   *     ZONE 3 CLEARED
+   *     +6,200 KG            ON PACE
+   *
+   * The headline is what happened, the delta is what it paid, and the verdict is
+   * the only thing the player has to act on — so it sits alone on the right and
+   * is stated in words. Called five times in a run, at a boundary the game has
+   * already slowed down for.
+   */
+  zoneRecap(zoneIndex, gainedKg, onPace) {
+    const z = zoneIndex | 0;
+    this.elBannerText.textContent = z >= 0 && z < ZONE_CLEARED.length
+      ? ZONE_CLEARED[z] : 'ZONE ' + z + ' CLEARED';
+
+    const kg = Math.round(gainedKg) || 0;
+    this.elBannerDelta.textContent = (kg < 0 ? '−' : '+') + groupInt(kg < 0 ? -kg : kg) + ' KG';
+    this.elBannerVerdict.textContent = onPace ? TXT_ON_PACE : TXT_BEHIND_PACE;
+    this.elBannerRow.className = CLS_BANNER_ROW;
+
+    this.elBanner.className = onPace ? CLS_BANNER_GOOD : CLS_BANNER_WARN;
+    this.bannerOn = true;
+    this.bannerTimer = TUNING.ui.bannerTime;
+  }
+
+  /**
+   * §17's first taste: the tier's name stamped over the middle of the screen for
+   * `TUNING.ui.stampTime` while the game is in its 0.5 s close-up. `sub` is an
+   * optional line under it ('FIRST BLOOD', the object's weight, …).
+   *
+   * The stamp is not chrome, so it does not dim with the rest of the HUD, and it
+   * restarts by alternating between two identical animations — the same
+   * reflow-free idiom the popups and the strike pips use.
+   */
+  stampTier(name, sub) {
+    this.elStampText.textContent = name === undefined || name === null ? '' : name;
+    this.elStampSub.textContent = sub === undefined || sub === null ? '' : sub;
+    this.stampFlip ^= 1;
+    this.elStamp.className = this.stampFlip ? CLS_STAMP_A : CLS_STAMP_B;
+    this.stampTimer = TUNING.ui.stampTime;
+  }
+
+  /**
+   * The paper tier's reward (§5): a pulse around the edge of the frame, which is
+   * free. It costs no hitstop, no speed and — because the flash is a class swap
+   * on a fixed element — no layout, no allocation and no style read.
+   */
+  flashEdge() {
+    this.edgeFlip ^= 1;
+    this.elEdge.className = this.edgeFlip ? CLS_EDGE_A : CLS_EDGE_B;
+  }
+
+  /**
+   * Fade the chrome. 0 is normal, 1 is gone. §17's scale reveal is a camera move
+   * and this is its on-screen half: the HUD gets out of the way of the shot.
+   */
+  setDim(k) {
+    this.dimHold = 0;
+    this.dimNow = clamp01(k);
+    this._writeDim();
+  }
+
+  /** Hold the chrome faded for `seconds`, ramping either side. */
+  dimFor(seconds) {
+    const s = Number(seconds) || 0;
+    if (s > this.dimHold) this.dimHold = s;
+  }
+
+  /**
+   * A short tag on the target line — 'LAP 3' in endless, 'DAILY #142' in the
+   * daily. Empty or null removes it. Not on a per-frame path.
+   */
+  setRunTag(text) {
+    const t = text === undefined || text === null ? '' : '' + text;
+    if (t === this.runTag) return;
+    this.runTag = t;
+    this.elRunTag.textContent = t;
+    this.elRunTag.hidden = t === '';
   }
 
   /** Per-frame with unscaled dt. Drives the reel roll and the banner timer. */
@@ -613,6 +838,35 @@ export class Hud {
         this.elBanner.className = CLS_BANNER;
       }
     }
+    if (this.stampTimer > 0) {
+      this.stampTimer -= dt;
+      if (this.stampTimer <= 0) {
+        this.stampTimer = 0;
+        this.elStamp.className = CLS_STAMP;
+      }
+    }
+
+    // The reveal fades the chrome out for as long as the camera is out there,
+    // then brings it back. A written custom property costs nothing while the
+    // fade is not moving, which is every frame but ~30 per run.
+    const want = this.dimHold > 0 ? 1 : 0;
+    if (this.dimHold > 0) {
+      this.dimHold -= dt;
+      if (this.dimHold < 0) this.dimHold = 0;
+    }
+    if (this.dimNow !== want) {
+      // A missing `dimTime` would make the ramp NaN, and a NaN never converges —
+      // the chrome would quantise to 0 and the whole HUD would stay invisible for
+      // the rest of the run. The fallback is the same value the key carries.
+      const ramp = TUNING.ui.dimTime > 0 ? TUNING.ui.dimTime : DIM_TIME_FALLBACK;
+      this.dimNow = moveTowards(this.dimNow, want, dt / ramp);
+      this._writeDim();
+    }
+  }
+
+  /** §16.12's device buzz, routed through the module-level guard. */
+  haptic(kind) {
+    return haptic(kind);
   }
 
   setVisible(v) {
@@ -661,6 +915,16 @@ export class Hud {
     this.bannerOn = false;
     this.bannerTimer = 0;
     this.elBanner.className = CLS_BANNER;
+    this.elBannerRow.className = CLS_BANNER_ROW_OFF;
+
+    this.stampTimer = 0;
+    this.elStamp.className = CLS_STAMP;
+    this.elEdge.className = CLS_EDGE;
+    this.setRunTag('');
+
+    this.dimHold = 0;
+    this.dimNow = 0;
+    this._writeDim();
 
     for (let i = 0; i < this.popCount; i++) {
       if (this.popAlive[i] === 0 && this.popLastX[i] === -9999) continue;
@@ -775,6 +1039,15 @@ export class Hud {
       this.anchorX = width * 0.5;
       this.anchorY = height * 0.10;
     }
+  }
+
+  _writeDim() {
+    let step = ((1 - this.dimNow) * FRAC_STEPS + 0.5) | 0;
+    if (step < 0) step = 0;
+    else if (step > FRAC_STEPS) step = FRAC_STEPS;
+    if (step === this.dimStep) return;
+    this.dimStep = step;
+    this.root.style.setProperty('--chrome', FRAC_STR[step]);
   }
 
   /** Restart the counter's punch without touching the reel's contents. */

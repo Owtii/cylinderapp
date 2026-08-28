@@ -1,7 +1,7 @@
 import { TUNING } from '../tuning.js';
 import { clamp, moveTowards } from '../core/math.js';
 import { Rng } from '../core/rng.js';
-import { PROPS } from './objects.js';
+import { PROPS, outlineScale } from './objects.js';
 import { speedAtWeight } from './trackplan.js';
 import { laneX, ROAD_HALF } from './track.js';
 
@@ -54,10 +54,15 @@ export const TRAFFIC_EVENT = { HORN: 0, BRAKE: 1, CRASH: 2, ESCAPE: 3 };
 
 /* Traffic only ever wears a vehicle silhouette, so it draws from these keys rather
    than the whole catalogue — `pickVisual` would happily hand a 170 kg target a
-   wooden crate, and a crate doing 20 m/s down the fast lane is not traffic. */
-const VEHICLE_KEYS = Object.keys(PROPS).filter(
-  (k) => !PROPS[k].blocker && (PROPS[k].tier === 'car' || PROPS[k].tier === 'truck'),
-);
+   wooden crate, and a crate doing 20 m/s down the fast lane is not traffic.
+   §17's furniture, set-piece parts and the fuel tanker are excluded by flag as well
+   as by tier: the tanker in particular is authored OUT of the truck tier precisely
+   so this nearest-weight pick cannot turn every heavy vehicle into one. */
+const VEHICLE_KEYS = Object.keys(PROPS).filter((k) => {
+  const p = PROPS[k];
+  if (p.blocker || p.furniture || p.tanker || p.setPiece) return false;
+  return p.tier === 'car' || p.tier === 'truck';
+});
 
 const EVENT_CAP = 32;
 
@@ -119,6 +124,8 @@ export class TrafficSystem {
     this.escapedCount = 0;
     this.smashed = 0;
     this.pileups = 0;            // cascade links resolved this run
+    this.reservedVisible = 0;    // see `reserve`
+    this.reservedNear = 0;
   }
 
   // ── authoring ───────────────────────────────────────────────────────────────
@@ -220,8 +227,7 @@ export class TrafficSystem {
       const span = Math.max(40, zone.dEnd - zone.dStart);
       const head = span * T.zoneHeadFraction;
       const usable = span - head - span * T.zoneTailFraction;
-      let ci = 0, clusterSize = 0, baseD = 0, laneMask = 0;
-      const clusterBase = this._clusterSeq;
+      let ci = 0, clusterSize = 0, baseD = 0, laneMask = 0, convoy = T.speedFactor;
       for (let i = 0; i < count; i++) {
         if (ci >= clusterSize) {
           clusterSize = 1;
@@ -231,6 +237,12 @@ export class TrafficSystem {
           baseD = zone.dStart + head + clamp(t, 0, 1) * usable;
           laneMask = 0;
           ci = 0;
+          // One cruising speed per clump. Per-vehicle jitter looks harmless and is
+          // not: a 0.08 spread on the speed factor is 4 m/s at zone speed, which
+          // pulls a clump 40 m apart over the ten seconds it spends in front of
+          // the player. The clump would still be authored and would never once be
+          // seen — and nothing could ever pile up.
+          convoy = T.speedFactor + rng.spread(T.speedFactorJitter);
           this._clusterSeq++;
         }
         const w = this._zw[i];
@@ -245,7 +257,7 @@ export class TrafficSystem {
         this._sk[n] = k;
         this._sl[n] = lane;
         this._sn[n] = rng.range(T.nerveMin, T.nerveMax);
-        this._sf[n] = T.speedFactor + rng.spread(T.speedFactorJitter);
+        this._sf[n] = convoy;
         this._sz[n] = z;
         this._sc[n] = this._clusterSeq & 0xffff;
         this.plannedWeight += w;
@@ -271,7 +283,6 @@ export class TrafficSystem {
     this._ev.count = 0;
     if (!this.plan) return 0;
 
-    const T = TUNING.traffic;
     const R = TUNING.read;
     const window = Math.max(10, speedAtWeight(playerWeight));
     const far = playerD + R.fadeInSeconds * window;
@@ -369,6 +380,20 @@ export class TrafficSystem {
     return n;
   }
 
+  /**
+   * Reserve part of §6.1's global object budget for the parked world.
+   *
+   * Traffic and `WorldStream` each hold their own list, so neither can see the
+   * other's count. Left alone, traffic keeps to its own share (`traffic.maxVisible`
+   * / `maxNear`), and the two shares are sized to add up. Calling this in front of
+   * `update` each frame with the streamer's live counts makes the joint cap exact
+   * rather than merely sound.
+   */
+  reserve(visibleUsed, nearUsed) {
+    this.reservedVisible = visibleUsed | 0;
+    this.reservedNear = nearUsed | 0;
+  }
+
   dispose() {
     for (let i = 0; i < this._liveCount; i++) this._retire(this._live[i], false);
     this._liveCount = 0;
@@ -390,12 +415,22 @@ export class TrafficSystem {
         continue;
       }
       if (this._liveCount >= this._live.length) break;
-      this._spawn(i, playerSpeed);
+      // No instance, no vehicle. A traffic record without a drawn body would be a
+      // car you crash into that was never on screen, which is the one failure this
+      // system is not allowed to have.
+      const handle = this.props.alloc(VEHICLE_KEYS[this._sk[i]]);
+      if (handle < 0) {
+        this.missedWeight += this._sw[i];
+        this.missedCount++;
+        this._cursor++;
+        continue;
+      }
+      this._spawn(i, playerSpeed, handle);
       this._cursor++;
     }
   }
 
-  _spawn(i, playerSpeed) {
+  _spawn(i, playerSpeed, handle) {
     const T = TUNING.traffic;
     const key = VEHICLE_KEYS[this._sk[i]];
     const def = PROPS[key];
@@ -408,6 +443,7 @@ export class TrafficSystem {
     v.id = TRAFFIC_ID_BASE + i;
     v.key = key; v.def = def; v.weight = this._sw[i]; v.scale = sc;
     v.role = 'TRAFFIC'; v.blocker = false; v.zone = this._sz[i]; v.moving = true;
+    v.outline = outlineScale(key);
     v.d = d; v.x = x; v.y = y; v.z = -d; v.lane = this._sl[i];
     v.baseRotY = 0; v.yaw = 0; v.rotY = 0;
     v.halfWidth = def.size[0] * 0.5 * sc;
@@ -429,7 +465,7 @@ export class TrafficSystem {
     v.panic = 0; v.panicked = false; v.flare = 0; v.horned = false;
     v.shoved = false; v.depth = 0; v.spin = 0; v.escaped = false; v.evade = EVADE_NONE;
     v.driftTimer = this._rng.range(T.driftPeriodMin, T.driftPeriodMax);
-    v.handle = this.props.alloc(key);
+    v.handle = handle;
   }
 
   /** Integrate every live vehicle: cruise, drift, panic, tumble. */
@@ -447,11 +483,19 @@ export class TrafficSystem {
         // A wreck coasts. It keeps whatever the impact gave it, bleeds off through
         // drag, and spins flat on the road — the only rotation `PropRenderer.place`
         // exposes, and the only one a car sliding on its wheels would show anyway.
+        //
+        // Exponential drag never actually reaches zero, so it is snapped: a wreck
+        // that has stopped has to STOP, or it creeps down the ramp forever at a
+        // millimetre a second and the pileup slowly walks away from where it
+        // happened.
         const decay = Math.exp(-T.shoveDrag * dt);
         v.vx *= decay;
         v.speed *= decay;
         v.yaw += v.spin * dt;
         v.spin *= decay;
+        if (Math.abs(v.vx) < T.settleEpsilon) v.vx = 0;
+        if (v.speed < T.settleEpsilon) v.speed = 0;
+        if (Math.abs(v.spin) < T.settleEpsilon) v.spin = 0;
       } else {
         // ── the scatter: do they see you yet?
         const closing = playerSpeed - v.speed;
@@ -555,8 +599,14 @@ export class TrafficSystem {
       v.evade = EVADE_BOLT;
       v.targetX = side * (ROAD_HALF + v.halfWidth + T.escapeClearance + T.exitOvershoot);
     } else if (v.nerve >= T.swerveNerve) {
+      // Two lanes over, not all the way to the verge. Sending every swerver to the
+      // outermost lane pins the whole scatter against both kerbs, and a player who
+      // follows the panic then finds a wall on one side and an empty road on the
+      // other. A two-lane shift spreads the survivors across the outer HALF of the
+      // road, which is what makes chasing the scatter a line rather than a choice
+      // between two extremes.
       v.evade = EVADE_SWERVE;
-      v.lane = side > 0 ? n - 1 : 0;
+      v.lane = clamp(v.lane + side * T.swerveLanes, 0, n - 1);
       v.targetX = laneX(v.lane);
       v.flare = T.flareTime;                   // the white light: they are braking
       this._emit(TRAFFIC_EVENT.BRAKE, v, 1 - v.nerve);
@@ -575,38 +625,65 @@ export class TrafficSystem {
   /**
    * The pileup.
    *
+   * The player's own wash starts some of these (see `shockwave`), but most pileups
+   * start with the traffic itself. The scatter sends a braking car and a bolting car
+   * through the same piece of road three seconds apart in intent and half a second
+   * apart in fact, and they hit each other. That is the version worth having: it
+   * happens IN FRONT of the player, in clear view, caused by them but not by their
+   * bumper, and it leaves a field of stationary wrecks to drive through.
+   *
    * One O(n^2) sweep over at most `poolSize` vehicles, which at 24 is a few hundred
-   * compares and cheaper than any structure that would avoid them. Only vehicles
-   * already carrying a shove can start one, and only vehicles not yet carrying one
-   * can receive it, so a car enters the cascade exactly once and the pass cannot
-   * revisit its own work.
+   * compares and cheaper than any structure that would avoid them.
+   *
+   * Termination is structural rather than checked. A vehicle can only be recruited
+   * into a wreck once (`shove` refuses a car that is already shoved), so the pass can
+   * never revisit its own work; `depth` rises by one along every chain and a car at
+   * `cascadeMaxDepth` still tumbles but can no longer pass the shove on; and nothing
+   * here recurses. The six-car pileup is the ceiling as well as the goal.
    */
   _cascade() {
     const T = TUNING.traffic;
     const n = this._liveCount;
     for (let i = 0; i < n; i++) {
       const a = this._live[i];
-      if (!a.alive || !a.shoved || a.depth >= T.cascadeMaxDepth) continue;
-      const moving = Math.abs(a.vx) + Math.abs(a.speed);
-      if (moving < T.cascadeMinSpeed) continue;
-
-      for (let j = 0; j < n; j++) {
-        if (j === i) continue;
+      if (!a.alive) continue;
+      // A car cannot rear-end four cars in the same sixtieth of a second. Capping
+      // the fan-out per pass is what keeps a dense clump reading as a chain of
+      // impacts you can follow rather than one frame in which everything explodes.
+      let fanout = 0;
+      for (let j = i + 1; j < n && fanout < T.cascadeFanout; j++) {
         const b = this._live[j];
-        if (!b.alive || b.shoved) continue;
+        if (!b.alive) continue;
+        // Calm traffic does not crash into itself. Without this gate a lane drift
+        // that put two cars in the same lane would read as a random explosion.
+        if (a.shoved && b.shoved) continue;
+        if (!a.shoved && !b.shoved && !a.panicked && !b.panicked) continue;
         if (Math.abs(a.cx - b.cx) > a.ex + b.ex) continue;
         if (Math.abs(a.cz - b.cz) > a.ez + b.ez) continue;
         if (Math.abs(a.cy - b.cy) > a.ey + b.ey) continue;
 
+        // A wreck always does the hitting; between two upright cars it is whoever
+        // is going faster.
+        let hit = a, got = b;
+        if (b.shoved && !a.shoved) { hit = b; got = a; }
+        else if (!a.shoved && !b.shoved && b.speed > a.speed) { hit = b; got = a; }
+        if (hit.shoved && hit.depth >= T.cascadeMaxDepth) continue;
+
+        const rel = Math.abs(hit.speed - got.speed) + Math.abs(hit.vx - got.vx);
+        if (rel < T.cascadeMinSpeed) continue;
+
         // Momentum goes one way and is lossy, which is what stops a pileup from
         // ringing: each link is quieter than the one before it.
-        const push = a.cx >= b.cx ? -1 : 1;
-        const vx = (Math.abs(a.vx) * T.cascadeLoss + T.cascadeSpread) * push;
-        const vz = -(a.speed - b.speed) * T.cascadeLoss;
-        if (this.shove(b, vx, vz, a.depth + 1)) this.pileups++;
-        a.vx *= T.cascadeLoss;
-        a.speed *= T.cascadeLoss;
-        break;                                  // one strike per shover per frame
+        const push = hit.cx >= got.cx ? -1 : 1;
+        const vx = (Math.abs(hit.vx) * T.cascadeLoss + T.cascadeSpread) * push;
+        const depth = hit.shoved ? hit.depth + 1 : 0;
+        if (this.shove(got, vx, -rel * T.cascadeLoss, depth)) { this.pileups++; fanout++; }
+        if (hit.shoved) {
+          hit.vx *= T.cascadeLoss;
+          hit.speed *= T.cascadeLoss;
+        } else {
+          this.shove(hit, -vx * 0.5, rel * T.cascadeLoss * 0.4, depth);
+        }
       }
     }
   }
@@ -683,10 +760,16 @@ export class TrafficSystem {
         if (score > worst) { worst = score; victim = i; }
       }
       if (victim < 0) break;
-      const v = this._live[victim];
-      visible--;
-      this._retire(v, true);
-      v.visible = false;
+      // Take the whole clump, not one car out of the middle of it. A clump is a
+      // single read; half a clump is a hole in one.
+      const cluster = this._live[victim].cluster;
+      for (let i = 0; i < this._liveCount; i++) {
+        const v = this._live[i];
+        if (!v.visible || v.cluster !== cluster) continue;
+        visible--;
+        this._retire(v, true);
+        v.visible = false;
+      }
       near = this._nearClusters(playerD, nearEnd);
     }
 
@@ -731,9 +814,8 @@ export class TrafficSystem {
   _writeTransforms() {
     for (let i = 0; i < this._liveCount; i++) {
       const v = this._live[i];
-      if (!v.alive) continue;
-      if (v.handle < 0) v.handle = this.props.alloc(v.key);
-      if (v.handle >= 0) this.props.place(v.key, v.handle, v.x, v.y, v.z, v.rotY, v.scale);
+      if (!v.alive || v.handle < 0) continue;
+      this.props.place(v.key, v.handle, v.x, v.y, v.z, v.rotY, v.scale);
     }
   }
 
@@ -747,22 +829,6 @@ export class TrafficSystem {
     ev.weight[n] = v.weight;
   }
 }
-
-/**
- * Reserve part of §6.1's global object budget for the parked world.
- *
- * Traffic and `WorldStream` each hold their own list, so neither can see the other's
- * count. Left alone, traffic keeps to its own share (`traffic.maxVisible` /
- * `maxNear`) and the two shares are sized to add up. Wiring this in front of
- * `update` each frame with the streamer's live counts makes the joint cap exact
- * instead of merely sound.
- */
-TrafficSystem.prototype.reservedVisible = 0;
-TrafficSystem.prototype.reservedNear = 0;
-TrafficSystem.prototype.reserve = function reserve(visibleUsed, nearUsed) {
-  this.reservedVisible = visibleUsed | 0;
-  this.reservedNear = nearUsed | 0;
-};
 
 /* ─────────────────────────────────────────────────────────────────── helpers ── */
 
@@ -872,6 +938,12 @@ function makeVehicle() {
     cx: 0, cy: 0, cz: 0, ex: 0, ey: 0, ez: 0,
     alive: false, cooldown: 0, visible: false, labelled: false,
     outcome: 'CLEAN', colourT: 0, fade: 0, handle: -1,
+    // §17's three catalogue flags, carried so a consumer can walk this list and
+    // WorldStream's through one code path — `outline` is a numeric multiplier and
+    // an undefined here would reach the outline system as NaN. Traffic is never
+    // furniture, a tanker or set-piece geometry (see VEHICLE_KEYS), so those three
+    // are constant; `outline` comes from the catalogue in `_spawn`.
+    furniture: false, tanker: false, setPiece: false, outline: 1,
     // ── traffic only ──────────────────────────────────────────────────────────
     def: null, moving: true,
     speed: 0, vx: 0, targetX: 0, nerve: 1, speedFactor: 0.6, driftTimer: 0,

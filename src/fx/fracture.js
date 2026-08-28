@@ -75,6 +75,16 @@ export const MATERIAL_PHYSICS = {
   rubber:   { family: 'SHELL',    restitution: 0.75, friction: 0.80, density: 1100, dust: 0.00, pieceDensity: 0.35 },
   plastic:  { family: 'SHELL',    restitution: 0.50, friction: 0.40, density: 1050, dust: 0.06, pieceDensity: 0.45 },
   water:    { family: 'SHELL',    restitution: 0.50, friction: 0.40, density: 1000, dust: 0.10, pieceDensity: 0.45 },
+  // §17's three catalogue materials. Every one of them is a real prop material, so
+  // a missing row here is not a gap in a table, it is sixteen props — the whole
+  // furniture family, the hedges and the fuel tanker — baking `mat = -1` and
+  // fragmenting as fallback grey concrete.
+  chalk:    { family: 'PANEL',    restitution: 0.35, friction: 0.50, density: 1400, dust: 0.14, pieceDensity: 0.70 },
+  // A hedge is twigs, so it splinters like wood — but it neither bounces nor
+  // weighs anything, which is the entire difference between a hedge and a fence.
+  foliage:  { family: 'SPLINTER', restitution: 0.12, friction: 0.85, density: 300,  dust: 0.30, pieceDensity: 1.30 },
+  // The tanker's hazard bands are paint on steel and tear with the steel (§17).
+  orange:   { family: 'PANEL',    restitution: 0.35, friction: 0.50, density: 3000, dust: 0.08, pieceDensity: 0.70 },
 };
 
 /** Stable order, so `mat[]` indices survive as long as the table above does. */
@@ -1067,7 +1077,12 @@ export function gradeSizes(plan, lx, ly, lz) {
     const t = smoothstep(plan.grade[i] * inv);
     plan.grade[i] = t;
     const f = near + (far - near) * t;
-    const v = plan.sx[i] * plan.sy[i] * plan.sz[i];
+    // Weight by the archetype's fill ratio. A plan mixes a 0.19 sliver with a 0.92
+    // plate, so normalising on the bounding box conserves boxes rather than matter
+    // — and `fx/fragments.js` takes a fragment's MASS from these extents times the
+    // same ratio, which made a corner hit on a van throw a third more debris mass
+    // than a centre hit on the same van.
+    const v = plan.sx[i] * plan.sy[i] * plan.sz[i] * HULL_ARCHETYPES[plan.hull[i]].volumeRatio;
     volBase += v;
     volGraded += v * f * f * f;
   }

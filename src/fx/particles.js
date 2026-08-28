@@ -560,6 +560,10 @@ export class ParticleSystem {
    * @private
    */
   _headroom(L, n) {
+    // A non-finite request must ask for nothing, not for everything: `NaN <= free`
+    // is false, so without this the fall-through below hands the caller the whole
+    // free capacity and one bad `energy01` fills the layer with NaN particles.
+    if (!(n > 0)) return 0;
     const free = L.cap - L.pool.activeCount;
     if (n <= free) return n;
     if (free > 0) return free;

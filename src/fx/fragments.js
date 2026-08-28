@@ -424,6 +424,20 @@ export class FragmentSystem {
     /** @type {null|((record:object)=>void)} */
     this.onSecondaryKill = null;
 
+    // A kill is QUEUED during integration and acted on afterwards. Both halves of
+    // acting on one — the handler and the generation-1 debris — go through the ring
+    // pool, and a steal reorders `pool.active` underneath the walk that found the
+    // kill, which double-integrates whichever fragment the steal relocated.
+    const killCap = Math.max(4, (D.secondaryMaxKillsPerFrame | 0) * 2);
+    this._killRec = new Array(killCap).fill(null);
+    this._killX = new Float32Array(killCap);
+    this._killY = new Float32Array(killCap);
+    this._killZ = new Float32Array(killCap);
+    this._killVX = new Float32Array(killCap);
+    this._killVY = new Float32Array(killCap);
+    this._killVZ = new Float32Array(killCap);
+    this._killCount = 0;
+
     // ── viewer, for the visual-only range test
     this._hasViewer = false;
     this._camX = 0; this._camY = 0; this._camZ = 0;
@@ -770,6 +784,7 @@ export class FragmentSystem {
     if (this._disposed) return;
     if (!(dt > 0)) dt = 0;
     this._integrate(dt);
+    this._flushKills();
     this._resolveBigContacts();
     this._writeInstances();
   }
@@ -794,7 +809,8 @@ export class FragmentSystem {
     const secRadius = D.secondaryRadiusScale;
     const secPeriod = D.secondaryProbePeriod;
     const secMinSpeed2 = D.secondaryMinSpeed * D.secondaryMinSpeed;
-    let killsLeft = secProbe ? (D.secondaryMaxKillsPerFrame | 0) : 0;
+    const killCap = this._killRec.length;
+    let killsLeft = secProbe ? Math.min(D.secondaryMaxKillsPerFrame | 0, killCap) : 0;
 
     for (let a = pool.activeCount - 1; a >= 0; a--) {
       const i = act[a];
@@ -913,16 +929,46 @@ export class FragmentSystem {
           this.probeT[i] = secPeriod;
           if (vxi * vxi + vyi * vyi + vzi * vzi >= secMinSpeed2) {
             const rec = secProbe(x, y, z, this.radius[i] * secRadius);
-            if (rec && rec.alive !== false) {
+            if (rec && rec.alive !== false && this._queueKill(rec, x, y, z, vxi, vyi, vzi)) {
               killsLeft--;
-              if (this.onSecondaryKill) this.onSecondaryKill(rec);
-              this._emitFromRecord(rec, x, y, z, vxi, vyi, vzi);
             }
           }
         } else {
           this.probeT[i] = t;
         }
       }
+    }
+  }
+
+  /**
+   * Remember a secondary kill until the integration walk is over. Returns false if
+   * another fragment already claimed this record THIS frame — without that check the
+   * deferral would let two shards be credited for the same object, which the old
+   * kill-in-place order prevented by marking it dead on the spot.
+   */
+  _queueKill(rec, x, y, z, vx, vy, vz) {
+    const n = this._killCount;
+    if (n >= this._killRec.length) return false;
+    for (let k = 0; k < n; k++) if (this._killRec[k] === rec) return false;
+    this._killRec[n] = rec;
+    this._killX[n] = x; this._killY[n] = y; this._killZ[n] = z;
+    this._killVX[n] = vx; this._killVY[n] = vy; this._killVZ[n] = vz;
+    this._killCount = n + 1;
+    return true;
+  }
+
+  /** Act on this frame's secondary kills, now that nothing is walking the pool. */
+  _flushKills() {
+    const n = this._killCount;
+    if (n === 0) return;
+    this._killCount = 0;
+    for (let k = 0; k < n; k++) {
+      const rec = this._killRec[k];
+      this._killRec[k] = null;
+      if (!rec || rec.alive === false) continue;
+      if (this.onSecondaryKill) this.onSecondaryKill(rec);
+      this._emitFromRecord(rec, this._killX[k], this._killY[k], this._killZ[k],
+        this._killVX[k], this._killVY[k], this._killVZ[k]);
     }
   }
 
@@ -964,6 +1010,9 @@ export class FragmentSystem {
     if (n < 2) return;
 
     const e = TUNING.destruction.bigCollisionRestitution;
+    // §6.1 holds for a fragment's whole life, not just its first frame: a contact
+    // that flings a big piece back up the hill would send it at the camera.
+    const maxToward = TUNING.destruction.maxTowardCamera;
     for (let a = 0; a < n - 1; a++) {
       const i = this.bigList[a];
       for (let b = a + 1; b < n; b++) {
@@ -1006,6 +1055,9 @@ export class FragmentSystem {
         this.asleep[j] = 0;
         this.wx[i] += ny * imp * invI; this.wz[i] -= nx * imp * invI;
         this.wx[j] -= ny * imp * invJ; this.wz[j] += nx * imp * invJ;
+
+        if (this.vz[i] > maxToward) this.vz[i] = maxToward;
+        if (this.vz[j] > maxToward) this.vz[j] = maxToward;
       }
     }
   }
@@ -1117,6 +1169,8 @@ export class FragmentSystem {
     if (this._disposed) return;
     this.pool.releaseAll();
     this.bigCount = 0;
+    for (let k = 0; k < this._killCount; k++) this._killRec[k] = null;
+    this._killCount = 0;
     this._counts.fill(0);
     this._prevCounts.fill(0);
     for (let m = 0; m < this.meshes.length; m++) {

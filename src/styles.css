@@ -42,6 +42,19 @@
   --accent: #cfe6ee;
   --accent-dim: #74898f;
 
+  /* BEHIND PACE. An amber-GREY (S 0.17) on a dark banner, never the outline
+     system's amber (S 0.87) — the word carries the meaning and the hue only has
+     to be different from ON PACE, which it is by 46 points of luminance. */
+  --pace-warn: #a2947c;
+
+  /* The medal ladder's three states, separated by LUMINANCE so the sheet reads
+     with the saturation at zero: the goal is the brightest thing, what you have
+     already earned recedes, what is out of reach is furniture.
+     next 0.848 · got 0.437 · locked 0.121 relative luminance. */
+  --rung-next: #f2ede0;
+  --rung-got: #a8b2ba;
+  --rung-locked: #59636c;
+
   /* OUTLINE SYSTEM PALETTE — owned by src/render/outlines.js.
      Exposed here so MODULE A's world labels and the title-screen legend match
      the rings exactly. Do not use these anywhere else. */
@@ -132,6 +145,16 @@ h1, h2, p { margin: 0; }
 .hud.on { opacity: 1; }
 .hud * { pointer-events: none; }
 
+/* Everything that is FURNITURE hangs off this wrapper, so §17's scale reveal
+   fades the whole HUD by writing one custom property. The first-taste stamp and
+   the paper-tier edge flash are deliberately outside it: they are beats, and a
+   beat that fires while the camera is pulled out still has to land. */
+.hud-chrome {
+  position: absolute;
+  inset: 0;
+  opacity: var(--chrome, 1);
+}
+
 .hud-labels { position: absolute; inset: 0; }
 
 .hud-zone {
@@ -212,6 +235,16 @@ h1, h2, p { margin: 0; }
   font-size: clamp(14px, 1.8vw, 21px);
 }
 .tgt-u { color: var(--dim); }
+/* The mode's tag rides on the target line — endless gains a lap counter and the
+   daily its number without the HUD gaining a corner. */
+.tgt-tag {
+  padding: 1px 6px 2px;
+  font-size: 0.85em;
+  letter-spacing: 0.18em;
+  color: var(--ink);
+  background: var(--muted);
+}
+.tgt-tag[hidden] { display: none; }
 
 .tgt-track {
   position: relative;
@@ -499,6 +532,96 @@ h1, h2, p { margin: 0; }
 .banner.warn::after { background: var(--stripe); }
 .banner.warn .banner-text { color: var(--muted); }
 .banner.info::after { background: var(--rule-hi); }
+
+/* §16.4's second line: what the zone paid, and the verdict. The verdict is a
+   WORD — ON PACE / BEHIND PACE — and its colour only has to keep the two apart
+   at a glance, so BEHIND PACE gets `--pace-warn`: an amber-GREY at S 0.17, six
+   times less saturated than the outline amber it must never be mistaken for,
+   and 46 points of luminance away from the ON PACE accent so the two separate
+   in greyscale as well. */
+.banner-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 18px;
+  margin-top: 5px;
+  padding-top: 5px;
+  border-top: 1px solid var(--rule);
+  font-size: clamp(11px, 1.5vw, 16px);
+  letter-spacing: 0.2em;
+}
+.banner-row.off { display: none; }
+.banner-delta {
+  color: var(--bone);
+  font-variant-numeric: tabular-nums;
+}
+.banner-verdict { color: var(--accent); }
+.banner.warn .banner-verdict { color: var(--pace-warn); }
+.banner.warn .banner-delta { color: var(--muted); }
+
+/* ───────────────────────────────────── first taste: the tier stamp (§17) ── */
+/*
+ * Half a second, dead centre, one word. It plays by alternating between two
+ * identical animations, the same reflow-free restart the popups use, and its
+ * base state is transparent so nothing lingers when the animation ends.
+ */
+.stamp {
+  position: absolute;
+  left: 50%;
+  top: 44%;
+  transform: translate(-50%, -50%);
+  padding: 10px 26px 12px;
+  text-align: center;
+  opacity: 0;
+  border-top: 2px solid var(--bone);
+  border-bottom: 2px solid var(--bone);
+}
+.stamp-text {
+  font-size: clamp(46px, 11vw, 132px);
+  line-height: 0.92;
+  letter-spacing: 0.14em;
+  color: var(--bone);
+  text-shadow: 0 4px 0 #000, 0 0 40px rgba(0, 0, 0, 0.8);
+}
+.stamp-sub {
+  margin-top: 4px;
+  font-size: clamp(10px, 1.4vw, 15px);
+  letter-spacing: 0.34em;
+  color: var(--muted);
+}
+@keyframes stampHitA {
+  0% { opacity: 0; transform: translate(-50%, -50%) scale(1.22); }
+  14% { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+  70% { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+  100% { opacity: 0; transform: translate(-50%, -50%) scale(1.06); }
+}
+@keyframes stampHitB {
+  0% { opacity: 0; transform: translate(-50%, -50%) scale(1.22); }
+  14% { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+  70% { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+  100% { opacity: 0; transform: translate(-50%, -50%) scale(1.06); }
+}
+.stamp.on.a { animation: stampHitA var(--stamp-life, 0.5s) cubic-bezier(0.15, 0.85, 0.25, 1); }
+.stamp.on.b { animation: stampHitB var(--stamp-life, 0.5s) cubic-bezier(0.15, 0.85, 0.25, 1); }
+
+/* ───────────────────────────────── the paper tier's reward: an edge flash ── */
+/*
+ * §5: paper costs the player NOTHING — no hitstop, no speed, not one frame. All
+ * it gets is this, and a 2 deg FOV punch from the camera. It is an inset
+ * box-shadow on a fixed element, so firing it is a class swap: no layout, no
+ * paint outside the border, no allocation. Bone-white, never green: the clean
+ * outline owns that hue.
+ */
+.edge {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  box-shadow: inset 0 0 clamp(40px, 9vw, 120px) rgba(236, 229, 210, 0.55);
+}
+@keyframes edgeFlashA { from { opacity: 0.85; } to { opacity: 0; } }
+@keyframes edgeFlashB { from { opacity: 0.85; } to { opacity: 0; } }
+.edge.on.a { animation: edgeFlashA var(--edge-life, 0.14s) linear; }
+.edge.on.b { animation: edgeFlashB var(--edge-life, 0.14s) linear; }
 
 /* ───────────────────────────────────────────────────── pooled popups ────── */
 
@@ -944,6 +1067,10 @@ h1, h2, p { margin: 0; }
   gap: 12px;
   min-height: 46px;
 }
+/* A class that sets `display` outranks the UA's `[hidden]` rule, so anything
+   this file lays out and the code hides has to say so here — the haptics row
+   vanishes on every device without a vibrator. */
+.row[hidden], .settings-head[hidden] { display: none; }
 .row-label {
   flex: none;
   width: 8ch;
@@ -1017,6 +1144,32 @@ h1, h2, p { margin: 0; }
 }
 .seg-btn:last-child { border-right: 0; }
 .seg-btn.on { color: var(--ink); background: var(--accent); }
+/* Locked reads as locked with no colour at all: it is darker than the steel it
+   sits on and it carries a ✕, which is the same lock the strike pips use. */
+.seg-btn.locked {
+  color: var(--rung-locked);
+  background: #0c1116;
+  cursor: default;
+}
+.seg-btn.locked::after { content: ' ✕'; letter-spacing: 0; }
+
+/* ── the title screen's mode strip (§16.10, §16.11) ───────────────────────
+   Three chips, not three screens. A chip stops its click from reaching the
+   screen, which is otherwise one big start button. */
+.modestrip {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.modestrip-k { font-size: 10px; letter-spacing: 0.28em; color: var(--dim); }
+.mode-seg { max-width: 420px; }
+.modestrip-note {
+  margin-top: -6px;
+  min-height: 12px;
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: var(--dim);
+}
 
 .actions { display: flex; flex-direction: column; gap: 10px; margin-top: 4px; }
 
@@ -1154,6 +1307,125 @@ h1, h2, p { margin: 0; }
   border-top: 1px solid var(--rule);
   font-variant-numeric: tabular-nums;
 }
+.next[hidden] { display: none; }
+
+/* ── the medal ladder (§16.2) ─────────────────────────────────────────────
+   Every threshold, every run, won or lost. State is a BADGE — ✓ earned, » next,
+   · locked — over a luminance ladder, so it survives greyscale twice over. The
+   next rung is the brightest thing in the block because it is the only one the
+   player can still do anything about. */
+.ladder {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--rule);
+  background: rgba(8, 11, 15, 0.55);
+}
+.ladder-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 10px 5px;
+  border-bottom: 1px solid var(--rule);
+  background: rgba(255, 255, 255, 0.03);
+}
+.ladder-k { font-size: 10px; letter-spacing: 0.28em; color: var(--muted); }
+.ladder-house {
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.rung {
+  display: grid;
+  grid-template-columns: 1.6em minmax(0, 1fr) auto auto 2.4ch minmax(7ch, auto);
+  align-items: baseline;
+  gap: 0 8px;
+  padding: 7px 10px;
+  border-bottom: 1px solid #161d25;
+  border-left: 4px solid transparent;
+}
+.rung:last-child { border-bottom: 0; }
+.rung-badge { font-size: 15px; line-height: 1; text-align: center; }
+.rung-name { font-size: 14px; letter-spacing: 0.2em; }
+.rung-mult {
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+.rung-at {
+  font-size: 15px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.rung-u { font-size: 9px; letter-spacing: 0.14em; color: var(--dim); }
+.rung-need {
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.rung.got { color: var(--rung-got); }
+.rung.got .rung-badge, .rung.got .rung-name, .rung.got .rung-at { color: var(--rung-got); }
+.rung.got .rung-need { color: var(--rung-got); }
+
+.rung.next {
+  border-left-color: var(--rung-next);
+  background: rgba(255, 255, 255, 0.045);
+}
+.rung.next .rung-badge, .rung.next .rung-name, .rung.next .rung-at { color: var(--rung-next); }
+.rung.next .rung-need { color: var(--accent); }
+
+.rung.locked { color: var(--rung-locked); }
+.rung.locked .rung-badge, .rung.locked .rung-name,
+.rung.locked .rung-at, .rung.locked .rung-need { color: var(--rung-locked); }
+
+/* ── the share line (§16.10) ──────────────────────────────────────────────
+   Printed first, copied second. `user-select: text` is the fallback the whole
+   clipboard path degrades to, so it is not optional. */
+.share {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.share-line {
+  flex: 1 1 16ch;
+  min-width: 0;
+  padding: 7px 10px;
+  font-size: 12px;
+  letter-spacing: 0.1em;
+  text-transform: none;
+  color: var(--muted);
+  background: var(--well);
+  border: 1px solid var(--rule);
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
+}
+.share-btn { flex: 0 0 auto; min-height: 38px; padding: 0 14px; font-size: 11px; }
+.share-btn.done { color: var(--accent); border-color: var(--accent); }
+
+/* the other two modes, one press from the end of a run */
+.endmodes { display: flex; gap: 10px; }
+.endmodes .mode-btn { flex: 1; min-height: 40px; font-size: 12px; }
+.mode-btn.locked {
+  color: var(--rung-locked);
+  border-color: #1f272f;
+  cursor: default;
+}
+.mode-btn.locked:hover { color: var(--rung-locked); border-color: #1f272f; }
+.mode-btn.locked::after {
+  content: ' ✕';
+  letter-spacing: 0;
+}
 
 /* what was left on the ramp */
 .missed {
@@ -1288,6 +1560,14 @@ h1, h2, p { margin: 0; }
   .goal-k, .goal-u { letter-spacing: 0.16em; }
 }
 
+@media (max-width: 480px) {
+  /* The ladder loses its multiplier column before it loses a threshold. */
+  .rung { grid-template-columns: 1.4em minmax(0, 1fr) auto 2.2ch minmax(6ch, auto); }
+  .rung-mult { display: none; }
+  .modestrip { flex-direction: column; align-items: stretch; gap: 6px; }
+  .share-btn { flex: 1 1 100%; }
+}
+
 @media (max-width: 400px) {
   /* Must stay SMALLER than the base rule, which yields 38px here — a wider vw
      clamp in this query would grow the reel and shove it into the pips. */
@@ -1309,6 +1589,13 @@ h1, h2, p { margin: 0; }
 
 @media (prefers-reduced-motion: reduce) {
   .start-btn, .restart-btn { animation: none; }
+  /* The tier stamp still has to READ — it is information, not decoration — so it
+     holds and fades instead of punching. The edge flash is exactly the kind of
+     full-frame pulse this preference exists to switch off, and the tier is
+     already legible from the outline, the label and the sound. */
+  .stamp { transition: opacity 0.15s linear; }
+  .stamp.on.a, .stamp.on.b { animation: none; opacity: 1; }
+  .edge.on.a, .edge.on.b { animation: none; }
   .chain-body.pa, .chain-body.pb,
   .weigh.gain-a, .weigh.gain-b, .weigh.loss-a, .weigh.loss-b,
   .weigh.loss-a .reel-d, .weigh.loss-b .reel-d,

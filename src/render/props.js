@@ -37,6 +37,9 @@ export class PropRenderer {
     this.scene = scene;
     this.materials = createMaterials();
     this.groups = new Map();
+    // Bumped by reset(). A handle is only the handle its holder thinks it is if it
+    // was issued in the current epoch — see free()'s note on handles changing hands.
+    this.epoch = 0;
 
     const box = new THREE.BoxGeometry(1, 1, 1);
     const cyl = new THREE.CylinderGeometry(0.5, 0.5, 1, 14);
@@ -259,6 +262,10 @@ export class PropRenderer {
    * callers happen to run in. Returning the same handle twice would put a duplicate
    * in the free list and hand two owners the same instance, which shows up much
    * later as one prop wearing another prop's transform.
+   *
+   * `used` alone is not enough for a holder that survived a reset() — by then the
+   * slot has been reissued and `used` is 1 again, for somebody else. Anyone holding
+   * a handle across a possible reset must compare `epoch` too.
    */
   free(key, handle) {
     const g = this.groups.get(key);
@@ -281,6 +288,8 @@ export class PropRenderer {
   }
 
   reset() {
+    // Every handle issued so far is now stale, whoever is still holding it.
+    this.epoch = (this.epoch + 1) | 0;
     for (const g of this.groups.values()) {
       const cap = g.free.length;
       for (let i = 0; i < cap; i++) g.free[i] = cap - 1 - i;

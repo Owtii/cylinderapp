@@ -234,6 +234,47 @@ export function buildFormation(type, pool, rng, out, gapLanes, sweep) {
 }
 
 /**
+ * A run of highway furniture (§17).
+ *
+ * Deliberately NOT one of the six formations, and deliberately not subject to the
+ * object cap or the breathing-room rule: furniture is texture you can eat, not a
+ * decision, and the moment it starts competing for a slot with something the player
+ * has to judge it has stopped doing its job. It still snaps to lane centres — it is
+ * collidable and absorbable, so it has to sit where the player's line does.
+ *
+ * The run walks one lane and may drift a single lane sideways part way through,
+ * because a perfectly straight line of eleven cones reads as a wall.
+ *
+ * @param {string[]} keys   furniture keys, already drawn to a budget
+ * @param {number}   start  index into `keys` for the first piece
+ * @param {number}   count  how many to lay down
+ * @param {number}   lane   lane to start in
+ * @param {number}   drift  -1, 0 or +1 lanes, applied half way along
+ * @param {object[]} out    appended with descriptors in the formation shape
+ * @returns {number} the run's span in metres
+ */
+export function buildFurnitureRun(keys, start, count, lane, drift, rng, out) {
+  const n = TUNING.world.laneCount;
+  const step = TUNING.read.furnitureRunStep;
+  const half = count >> 1;
+  let d = 0;
+  for (let i = 0; i < count; i++) {
+    const key = keys[start + i];
+    if (!key) break;
+    const def = PROPS[key];
+    if (!def) break;
+    let ln = i >= half ? lane + drift : lane;
+    if (ln < 0) ln = 0; else if (ln > n - 1) ln = n - 1;
+    out.push({
+      key, weight: def.weight, scale: 1, role: 'FURNITURE',
+      lane: ln, d, blocker: false, furniture: true,
+    });
+    d += step * (0.75 + rng.next() * 0.6);
+  }
+  return d;
+}
+
+/**
  * How many objects a formation type wants. The track builder uses this to slice
  * the zone's object list into formations without running one dry.
  */

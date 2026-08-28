@@ -615,7 +615,14 @@ export class Game {
     const done = this.squash.completed;
     for (let i = 0; i < done.count; i++) {
       const key = done.key[i];
+      const handle = done.handle[i];
       const cdef = PROPS[key];
+      // The crush borrowed this instance from the streamer and the squash hands it
+      // back here; nothing else will. Leaking it left the fully crushed mesh sitting
+      // on the road on top of its own fragments AND burned an instance slot, so
+      // after 160 smashes of one prop key alloc() started returning -1 and that prop
+      // stopped rendering for the rest of the run. Free it on every path.
+      if (handle >= 0) this.props.free(key, handle);
       if (!cdef) continue;
       const cx = done.x[i], cy = done.y[i], cz = done.z[i];
       const ry = done.rotY[i];

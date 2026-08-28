@@ -15,10 +15,12 @@ import { clamp, clamp01, semitones } from '../core/math.js';
 import { fxRng } from '../core/rng.js';
 import { AudioEngine, makeParams, resetParams, weightTerm01 } from './engine.js';
 import { SourceBank, loadHowler, makeHowlSource } from './sources.js';
-import { renderBanks, makeNoiseBuffer, makeLoopBuffer, bankKeys } from './synth.js';
-import { ImpactPlayer } from './impacts.js';
+import {
+  renderBanks, makeNoiseBuffer, makeLoopBuffer, makeShredLoopBuffer, makeReverbIr, bankKeys,
+} from './synth.js';
+import { ImpactPlayer, resolveMaterial, TIER_MATERIALS } from './impacts.js';
 import { MusicSystem } from './music.js';
-import { RollingLayer } from './rolling.js';
+import { RollingLayer, ShredLayer } from './rolling.js';
 
 /** Reused parameter block — the one-shot entry points must not allocate. */
 const P = makeParams();
@@ -30,6 +32,14 @@ const UI_KEYS = {
   hover: 'ui.hover',
 };
 
+/**
+ * §17 scatter sounds. `swerve` shares the brake bank deliberately — it is the
+ * same tyres, briefly, and a third bank for a sound that lasts 120 ms would be
+ * two more seconds on the loading bar for nothing.
+ */
+const SCATTER_KEYS = ['traffic.horn', 'traffic.brake', 'traffic.brake'];
+const SCATTER_KIND = { horn: 0, brake: 1, swerve: 2 };
+
 export class AudioSystem {
   constructor() {
     this.engine = new AudioEngine();
@@ -37,6 +47,7 @@ export class AudioSystem {
     this.impacts = null;
     this.music = null;
     this.rolling = null;
+    this.shred = null;
 
     this._ready = false;
     this._disposed = false;
@@ -62,12 +73,26 @@ export class AudioSystem {
      *  climb the ladder even when the caller does not pass one. */
     this._chain = 0;
 
+    /** §17 scatter crowd control: one window cap plus a per-kind cooldown. */
+    this._scatterWindow = -1e9;
+    this._scatterCount = 0;
+    this._scatterLast = new Float64Array(SCATTER_KEYS.length);
+    /** Bitmask of tiers whose first-taste stinger has already fired this run. */
+    this._tasted = 0;
+
     this._noiseBuf = null;
     this._rumbleLoop = null;
     this._windLoop = null;
+    this._shredLoop = null;
+    this._tunnelIr = null;
 
     this._manifest = null;
     this._howler = null;
+  }
+
+  /** 0..1 — how much of the mix the shredding roar owns right now (§5). */
+  get shredMix() {
+    return this.shred ? this.shred.mix : 0;
   }
 
   get ready() {
@@ -124,6 +149,11 @@ export class AudioSystem {
       this._noiseBuf = makeNoiseBuffer(ctx, 2.0, 1, 0xa17d51, false);
       this._rumbleLoop = makeLoopBuffer(ctx, 2.4, 1, 0x51d3c0, true);
       this._windLoop = makeLoopBuffer(ctx, 3.1, 2, 0x77a2be, true);
+      // Both of these are plain JS buffer fills, not offline renders: together
+      // they are a few milliseconds and they never touch the loading bar.
+      this._shredLoop = makeShredLoopBuffer(ctx, 1.9, 0x5c1e77, TUNING.audio.shredGrainDensity);
+      const irLen = TUNING.audio.tunnelIrSeconds > 0.05 ? TUNING.audio.tunnelIrSeconds : 1.6;
+      this._tunnelIr = makeReverbIr(ctx, irLen, TUNING.audio.tunnelDecay, 0x7c14);
       if (onProgress) onProgress(0.06);
 
       const banks = await renderBanks(ctx, this._noiseBuf, function (t) {
@@ -138,6 +168,9 @@ export class AudioSystem {
       this.music.build();
       this.rolling = new RollingLayer(eng, this._rumbleLoop, this._windLoop);
       this.rolling.start();
+      this.shred = new ShredLayer(eng, this._shredLoop);
+      this.shred.start();
+      eng.buildTunnel(this._tunnelIr);
 
       eng.setVolumes(this._volMaster, this._volSfx, this._volMusic);
       eng.setMuted(this._muted);
@@ -195,10 +228,12 @@ export class AudioSystem {
    *
    * @param {number} dt UNSCALED seconds
    * @param {object} s  { speed, speed01, weight, grounded, airborne, timeScale,
-   *                      playing, chain, zone, blockerDistance } — reused by the
-   *                      caller, never retained. `blockerDistance` is optional;
-   *                      without it the blocker hum never rises. `mass` and
-   *                      `combo` are accepted as v1 aliases for weight and chain.
+   *                      playing, chain, zone, blockerDistance, tunnel } —
+   *                      reused by the caller, never retained.
+   *                      `blockerDistance` and `tunnel` are optional; without
+   *                      them the blocker hum never rises and the tunnel send
+   *                      never opens. `mass` and `combo` are accepted as v1
+   *                      aliases for weight and chain.
    */
   update(dt, s) {
     if (!this._ready || this._disposed) return;
@@ -222,6 +257,13 @@ export class AudioSystem {
 
     this.rolling.setBlockerDistance(s && isFinite(s.blockerDistance) ? s.blockerDistance : Infinity);
     this.rolling.update(dt, speed, speed01, weight, !airborne, playing);
+
+    // §5. The roar decides how much of the destruction it is carrying, and the
+    // discrete impact layers get out of its way by exactly that much.
+    this.shred.update(dt, playing);
+    this.impacts.setShredMix(this.shred.mix);
+    // §17. Optional, like blockerDistance: without it the send never opens.
+    if (s && isFinite(s.tunnel)) this.engine.setTunnel(s.tunnel);
 
     // Music intensity: chain-driven, with any explicit setMusicIntensity as a floor.
     const full = TUNING.audio.musicChainFull > 0 ? TUNING.audio.musicChainFull : 12;
@@ -483,6 +525,167 @@ export class AudioSystem {
     this.bank.play(this.engine, key, P);
   }
 
+  // ──────────────────────────────────────────────── §5/§17 — the highway
+
+  /**
+   * How fast the player is destroying things, and what out of.
+   *
+   * Above `TUNING.audio.shredEnterRate` smashes a second the discrete one-shots
+   * stop being events and start being mud, so the impact layers duck out and a
+   * single continuous shredding roar takes over; it releases at
+   * `shredExitRate`, and that gap plus `shredMinHold` is what stops it
+   * chattering at the boundary. See `ShredLayer` in rolling.js.
+   *
+   * Safe (and cheap) to call every frame. Safe never to call at all: the rate
+   * decays on its own, so the roar can never be left on under a quiet ramp.
+   *
+   * @param {number} smashesPerSecond
+   * @param {number} massPerSecond kg/s being absorbed — drives the low end
+   * @param {string} materialKey   what is mostly being destroyed right now
+   */
+  setShredRate(smashesPerSecond, massPerSecond, materialKey) {
+    if (!this._ready || this._disposed) return;
+    const sps = smashesPerSecond > 0 && isFinite(smashesPerSecond) ? smashesPerSecond : 0;
+    const mps = massPerSecond > 0 && isFinite(massPerSecond) ? massPerSecond : 0;
+    // The average object going through the drum right now is what decides
+    // whether `heavy` means a bus or a silo, and it falls out of the two rates.
+    const avg = sps > 0.01 ? mps / sps : 0;
+    this.shred.setRate(sps, mps, resolveMaterial(materialKey, avg));
+  }
+
+  /**
+   * §17 secondary destruction: a fragment killing something on its way out.
+   * Quieter, tighter and slightly delayed, so it reads as a consequence of the
+   * hit you just made rather than as a hit of its own.
+   */
+  playSecondary(materialKey, objectWeight, playerWeight, pan) {
+    if (!this._ready || this._disposed) return;
+    this.impacts.playSecondary(materialKey, objectWeight, playerWeight, pan);
+  }
+
+  /**
+   * §17 — a fuel tanker going up. The biggest sound in the game that is not the
+   * house, and the only one with a real explosion's shape: a crack, a gap, then
+   * the pressure wave. The duck is deep enough that the music disappears under
+   * it, which is most of why it feels like a room-clearing event.
+   *
+   * @param {number} pan -1..1
+   * @param {number} playerWeight kg, for the sub under it
+   * @param {number} [intensity01]
+   */
+  playDetonation(pan, playerWeight, intensity01) {
+    if (!this._ready || this._disposed) return;
+    const A = TUNING.audio;
+    const pW = playerWeight > 0 ? playerWeight : TUNING.player.startWeight;
+    const i01 = intensity01 === undefined ? 1 : clamp01(intensity01);
+    resetParams(P);
+    P.bus = 'sfx';
+    P.gain = A.detonationGain * (0.75 + 0.25 * i01);
+    P.rate = 1 + fxRng.spread(0.04);
+    P.pan = clamp(pan, -1, 1) * 0.5;
+    P.protect = true;
+    this.bank.play(this.engine, 'tanker.blast', P);
+    this.impacts.sub(pW, A.detonationSubGain, pan);
+    this.engine.duck(A.detonationDuckDb, A.detonationDuckHold);
+  }
+
+  /**
+   * §17 the scatter — traffic reacting to you arriving. `kind` is `'horn'`,
+   * `'brake'` or `'swerve'`.
+   *
+   * This is texture, not feedback: it is capped per impact window, each kind
+   * has its own cooldown, and it is mixed well under the smash layers. A jam of
+   * twenty cars must sound like a jam, not like twenty horns.
+   *
+   * @param {string} kind
+   * @param {number} pan -1..1
+   * @param {number} distance01 0 = right beside you, 1 = at the edge of hearing
+   */
+  playScatter(kind, pan, distance01) {
+    if (!this._ready || this._disposed) return;
+    const A = TUNING.audio;
+    const now = this.engine.now;
+    const k = SCATTER_KIND[kind] === undefined ? 0 : SCATTER_KIND[kind];
+
+    if (now - this._scatterWindow > A.impactWindow) {
+      this._scatterWindow = now;
+      this._scatterCount = 0;
+    }
+    if (this._scatterCount >= A.scatterWindowMax) return;
+    if (now - this._scatterLast[k] < A.scatterCooldown) return;
+    this._scatterCount++;
+    this._scatterLast[k] = now;
+
+    const d = clamp01(distance01);
+    // No per-voice filter in the pool, so distance is carried by level and by a
+    // small drop in playback rate — which moves the whole spectrum down and
+    // reads as air between you and it.
+    const swerve = k === 2;
+    resetParams(P);
+    P.bus = 'sfx';
+    P.gain = A.scatterGain * (swerve ? 0.75 : 1) * (1 - A.scatterDistanceFalloff * d) /
+      (1 + this._scatterCount * 0.35);
+    P.rate = (swerve ? 1.35 : 1) * (1 - 0.12 * d) * (1 + fxRng.spread(0.05));
+    P.pan = clamp(pan, -1, 1);
+    if (swerve) P.duration = A.scatterSwerveClip;
+    this.bank.play(this.engine, SCATTER_KEYS[k], P);
+  }
+
+  /**
+   * §17 — inside a tunnel. 0 = open road, 1 = fully inside. Swaps the sfx bus
+   * onto a reverberant send and closes its top end, so every smash, and the
+   * roll itself, arrives off concrete. `update()` also reads this off the
+   * per-frame state as `s.tunnel`.
+   */
+  setTunnel(inside01) {
+    if (!this._ready || this._disposed) return;
+    this.engine.setTunnel(clamp01(inside01));
+  }
+
+  /**
+   * §17 first taste — the audio half of the one-time slow-motion close-up the
+   * first time the player meets a tier. A stab, transposed for the tier, with
+   * that tier's own body layer stamped underneath it at half speed: the tier
+   * name, said in its own voice.
+   *
+   * Fires at most once per tier per run: the caller's `meta.firstTaste(tier)`
+   * gates it, and this gates it again, because two stingers over one 0.5 s
+   * freeze would be worse than none.
+   *
+   * @param {number} tierIndex 0..5, zone order (glass → structures)
+   */
+  playFirstTaste(tierIndex) {
+    if (!this._ready || this._disposed) return;
+    const A = TUNING.audio;
+    const i = clamp(Math.floor(tierIndex || 0), 0, TIER_MATERIALS.length - 1);
+    const bit = 1 << i;
+    if (this._tasted & bit) return;
+    this._tasted |= bit;
+
+    const now = this.engine.now;
+    const table = A.tasteSemitones;
+    const semi = table && table.length > 0 ? table[i % table.length] : 0;
+    resetParams(P);
+    P.bus = 'sfx';
+    P.gain = A.tasteGain;
+    P.rate = semitones(semi);
+    P.protect = true;
+    this.bank.play(this.engine, 'taste.stinger', P);
+
+    // The tier's own voice, dropped an octave and landing with the stab.
+    resetParams(P);
+    P.bus = 'sfx';
+    P.gain = A.tasteBodyGain;
+    P.rate = A.tasteBodyRate;
+    P.pan = 0;
+    P.when = now + A.tasteStabDelay;
+    P.protect = true;
+    this.bank.play(this.engine, 'impact.' + TIER_MATERIALS[i] + '.body', P);
+
+    this.impacts.sub(TUNING.player.maxWeight * 0.25, A.tasteSubGain, 0);
+    this.engine.duck(A.tasteDuckDb, A.tasteDuckHold);
+  }
+
   // ── v1 names, kept so anything that still calls them keeps working ───────
 
   /** @deprecated the chain ding is one layer of `playAbsorb` now. */
@@ -620,10 +823,17 @@ export class AudioSystem {
     this._absorbWindow = -1e9;
     this._absorbCount = 0;
     this._chain = 0;
+    this._scatterWindow = -1e9;
+    this._scatterCount = 0;
+    // A new run gets its first tastes back.
+    this._tasted = 0;
     if (!this._ready || this._disposed) return;
+    for (let i = 0; i < this._scatterLast.length; i++) this._scatterLast[i] = -1e9;
     this.engine.stopAllVoices(0.05);
+    this.engine.setTunnel(0);
     this.impacts.reset();
     this.rolling.reset();
+    this.shred.reset();
     this.music.reset();
     this.bank.resetVariants();
   }
@@ -634,14 +844,18 @@ export class AudioSystem {
     this._ready = false;
     if (this.music) this.music.dispose();
     if (this.rolling) this.rolling.dispose();
+    if (this.shred) this.shred.dispose();
     this.bank.dispose();
     this.engine.dispose();
     this.impacts = null;
     this.music = null;
     this.rolling = null;
+    this.shred = null;
     this._noiseBuf = null;
     this._rumbleLoop = null;
     this._windLoop = null;
+    this._shredLoop = null;
+    this._tunnelIr = null;
   }
 }
 

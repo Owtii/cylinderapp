@@ -1,13 +1,17 @@
 import { TUNING } from '../tuning.js';
 import { clamp } from '../core/math.js';
-import { PROPS } from './objects.js';
+import { PROPS, outlineScale } from './objects.js';
 import { speedAtWeight } from './trackplan.js';
+import { inLaneSpan } from './track.js';
 
 const LANES = TUNING.world.laneCount;
 const SEG_LEN = TUNING.world.segmentLength;
 const GRID_Z = 8;
 const CELL_D = SEG_LEN / GRID_Z;
-const MAX_LIVE = 96;                 // pooled live-object records
+// §17's furniture is hundreds of small records rather than the dozens v2 streamed,
+// and it shares this pool with everything else. Sized so a furniture run inside a
+// window that already holds a full formation cannot starve the formation.
+const MAX_LIVE = 128;                // pooled live-object records
 
 /**
  * Streams the authored track plan.
@@ -21,6 +25,13 @@ const MAX_LIVE = 96;                 // pooled live-object records
  * more than `maxNearObjects` inside the near band. If the window would exceed
  * either, the least valuable object is dropped rather than the newest — a cheap
  * feeder disappearing is far less confusing than a centrepiece popping out.
+ *
+ * §17's highway furniture is EXEMPT from those two caps and carries its own. The
+ * caps exist to bound how many DECISIONS are on screen, and a cone is not a
+ * decision: it is 20 kg of paper the player rolls through without steering. Letting
+ * it compete for one of the twelve slots would delete a real object to make room
+ * for texture, which is exactly backwards. It is capped separately so a run of
+ * eleven bollards still cannot bury the read.
  */
 export class WorldStream {
   constructor(profile, roadBuilder, propRenderer) {
@@ -41,6 +52,7 @@ export class WorldStream {
     this.missedCount = 0;
     this._cells = new Uint8Array(GRID_Z * LANES);
     this._ramps = [];
+    this._strips = [];
   }
 
   reset(plan) {
@@ -106,7 +118,16 @@ export class WorldStream {
     }
   }
 
-  /** Road occupancy + ramps for one segment, derived from the plan's hazards. */
+  /**
+   * Road occupancy, ramps and surface strips for one segment, derived from the
+   * plan's hazards.
+   *
+   * §8's narrow is the same mechanism as a hole read the other way round: a hole
+   * removes the road inside a lane span, a narrow removes it everywhere OUTSIDE
+   * one. Building it out of the occupancy grid rather than as a new kind of
+   * geometry means the road builder, the colliders and the fragment ground query
+   * all understand it without knowing it exists.
+   */
   _segmentSpec(index) {
     const d0 = index * SEG_LEN;
     this._cells.fill(1);
@@ -122,6 +143,18 @@ export class WorldStream {
         }
       }
     }
+    for (let n = 0; n < this.plan.narrows.length; n++) {
+      const nr = this.plan.narrows[n];
+      if (nr.dEnd < d0 || nr.dStart > d0 + SEG_LEN) continue;
+      for (let row = 0; row < GRID_Z; row++) {
+        const a = d0 + row * CELL_D;
+        const b = a + CELL_D;
+        if (b <= nr.dStart || a >= nr.dEnd) continue;
+        for (let lane = 0; lane < LANES; lane++) {
+          if (lane < nr.laneFrom || lane > nr.laneTo) this._cells[row * LANES + lane] = 0;
+        }
+      }
+    }
     this._ramps.length = 0;
     for (let j = 0; j < this.plan.jumps.length; j++) {
       const r = this.plan.jumps[j];
@@ -129,24 +162,66 @@ export class WorldStream {
         this._ramps.push({ d: r.d - d0, x: r.x, width: r.width, length: r.length, height: r.height });
       }
     }
+    // Boost strips and oil slicks are painted road, not geometry: they change what
+    // the surface DOES, never where it is. Handed over in segment-local d so the
+    // road builder can lay them into the same vertex stream it already builds.
+    this._strips.length = 0;
+    collectStrips(this.plan.boosts, d0, 1, this._strips);
+    collectStrips(this.plan.slicks, d0, 2, this._strips);
+
     SPEC.cells = this._cells;
     SPEC.ramps = this._ramps;
+    SPEC.strips = this._strips;
     return SPEC;
   }
 
-  /** Surface height at a world position, or -Infinity over a hole. */
+  /** Surface height at a world position, or -Infinity where there is no road. */
   groundYAt(x, z) {
     const d = -z;
     if (d < 0) return this.profile.heightAt(0);
     for (let h = 0; h < this.plan.holes.length; h++) {
       const hole = this.plan.holes[h];
       if (d < hole.dStart || d > hole.dEnd) continue;
-      const halfLane = TUNING.world.laneWidth * 0.5;
-      const x0 = (hole.laneFrom - (LANES - 1) / 2) * TUNING.world.laneWidth - halfLane;
-      const x1 = (hole.laneTo - (LANES - 1) / 2) * TUNING.world.laneWidth + halfLane;
-      if (x > x0 && x < x1) return -Infinity;
+      if (inLaneSpan(x, hole.laneFrom, hole.laneTo)) return -Infinity;
+    }
+    for (let n = 0; n < this.plan.narrows.length; n++) {
+      const nr = this.plan.narrows[n];
+      if (d < nr.dStart || d > nr.dEnd) continue;
+      if (!inLaneSpan(x, nr.laneFrom, nr.laneTo)) return -Infinity;
     }
     return this.profile.heightAt(d);
+  }
+
+  /* ── §17 surface queries ─────────────────────────────────────────────────────
+   *
+   * Linear scans over a handful of spans, called once per frame from the player
+   * update. A spatial index would be faster and would also be the third structure
+   * in this file that has to be kept in step with the plan; at ~30 spans per track
+   * this is not where the frame goes.
+   */
+
+  /** 1 if the player is on a boost strip at (d, x), else 0. */
+  boostAt(d, x) { return onStrip(this.plan.boosts, d, x) ? 1 : 0; }
+
+  /** 1 if the player is on an oil slick at (d, x), else 0. */
+  slickAt(d, x) { return onStrip(this.plan.slicks, d, x) ? 1 : 0; }
+
+  /**
+   * The narrow the player is inside, or null. `out`, if given, is filled with the
+   * corridor's world-space edges so the caller allocates nothing.
+   */
+  narrowAt(d, out) {
+    const half = TUNING.world.laneWidth * 0.5;
+    for (let n = 0; n < this.plan.narrows.length; n++) {
+      const nr = this.plan.narrows[n];
+      if (d < nr.dStart || d > nr.dEnd) continue;
+      if (out) {
+        out.x0 = (nr.laneFrom - (LANES - 1) / 2) * TUNING.world.laneWidth - half;
+        out.x1 = (nr.laneTo - (LANES - 1) / 2) * TUNING.world.laneWidth + half;
+      }
+      return nr;
+    }
+    return null;
   }
 
   // ── objects ──────────────────────────────────────────────────────────────────
@@ -196,6 +271,11 @@ export class WorldStream {
 
     e.id = o.id; e.key = o.key; e.weight = o.weight; e.scale = sc;
     e.role = o.role; e.blocker = !!o.blocker; e.zone = o.zone;
+    // §17 tags, copied once at spawn so no per-frame consumer has to look the prop
+    // up in the catalogue. `moving` is always false here: WorldStream's objects are
+    // authored and static, and everything that drives is TrafficSystem's.
+    e.furniture = !!o.furniture; e.tanker = !!o.tanker; e.setPiece = !!o.setPiece;
+    e.outline = outlineScale(o.key); e.moving = false;
     e.d = o.d; e.x = o.x; e.y = y; e.z = -o.d; e.lane = o.lane; e.rotY = o.rotY;
     e.cx = o.x; e.cy = y + hh; e.cz = -o.d;
     e.ex = c * hw + s * hd; e.ey = hh; e.ez = s * hw + c * hd;
@@ -214,12 +294,13 @@ export class WorldStream {
   _enforceBudget(playerD, speed) {
     const R = TUNING.read;
     const nearEnd = playerD + R.nearBandSeconds * speed;
-    let visible = 0, near = 0;
+    let visible = 0, near = 0, texture = 0;
 
     for (let i = 0; i < this.liveCount; i++) {
       const e = this.live[i];
       e.visible = e.alive && e.d >= playerD - 20;
       if (!e.visible) continue;
+      if (e.furniture) { texture++; continue; }
       visible++;
       if (e.d <= nearEnd) near++;
     }
@@ -229,7 +310,7 @@ export class WorldStream {
       let cheapest = Infinity;
       for (let i = 0; i < this.liveCount; i++) {
         const e = this.live[i];
-        if (!e.visible || e.blocker) continue;            // never drop a blocker
+        if (!e.visible || e.blocker || e.furniture) continue;   // never drop a blocker
         if (near > R.maxNearObjects && e.d > nearEnd) continue;
         if (e.weight < cheapest) { cheapest = e.weight; victim = i; }
       }
@@ -239,6 +320,24 @@ export class WorldStream {
       if (e.handle >= 0) { this.props.free(e.key, e.handle); e.handle = -1; }
       visible--;
       if (e.d <= nearEnd) near--;
+    }
+
+    // Furniture's own ceiling. The FURTHEST piece goes, not the cheapest: every
+    // piece is worth about the same 40 kg, so the only meaningful ranking left is
+    // which one the player is closest to actually rolling over.
+    while (texture > R.maxFurnitureVisible) {
+      let victim = -1;
+      let furthest = -Infinity;
+      for (let i = 0; i < this.liveCount; i++) {
+        const e = this.live[i];
+        if (!e.visible || !e.furniture) continue;
+        if (e.d > furthest) { furthest = e.d; victim = i; }
+      }
+      if (victim < 0) break;
+      const e = this.live[victim];
+      e.visible = false;
+      if (e.handle >= 0) { this.props.free(e.key, e.handle); e.handle = -1; }
+      texture--;
     }
   }
 
@@ -263,9 +362,28 @@ export class WorldStream {
   }
 }
 
-const SPEC = { cells: null, ramps: null };
+const SPEC = { cells: null, ramps: null, strips: null };
 
 function swap(arr, a, b) { const t = arr[a]; arr[a] = arr[b]; arr[b] = t; }
+
+/** Is (d, x) inside one of a list of surface strips? */
+function onStrip(list, d, x) {
+  for (let i = 0; i < list.length; i++) {
+    const s = list[i];
+    if (d < s.d || d > s.d + s.length) continue;
+    if (Math.abs(x - s.x) <= s.width * 0.5) return true;
+  }
+  return false;
+}
+
+/** Segment-local copies of every strip overlapping one road segment. */
+function collectStrips(list, d0, kind, out) {
+  for (let i = 0; i < list.length; i++) {
+    const s = list[i];
+    if (s.d + s.length < d0 || s.d > d0 + SEG_LEN) continue;
+    out.push({ d: s.d - d0, x: s.x, width: s.width, length: s.length, kind });
+  }
+}
 
 function makeRecord() {
   return {
@@ -274,5 +392,10 @@ function makeRecord() {
     cx: 0, cy: 0, cz: 0, ex: 0, ey: 0, ez: 0,
     alive: false, cooldown: 0, visible: false, labelled: false,
     outcome: 'CLEAN', colourT: 0, fade: 0, handle: -1,
+    // §17: texture / the one detonating prop / staged set-piece geometry, and the
+    // outline intensity multiplier the catalogue gives the key. `moving` exists so
+    // a consumer can read a WorldStream record and a TrafficSystem record through
+    // the same field without asking which list it came from.
+    furniture: false, tanker: false, setPiece: false, outline: 1, moving: false,
   };
 }

@@ -65,6 +65,7 @@ export class SquashSystem {
     this.seed = new Int32Array(cap);
     this.phase = new Uint8Array(cap);        // 1 = at full crush, held one frame
     this.wreck = new Uint8Array(cap);        // 1 = strand it, do not fragment it
+    this.epoch = new Int32Array(cap);        // renderer epoch the handle was issued in
     this.count = 0;
 
     // Handed to the caller each frame. Flat, reused, never reallocated.
@@ -84,9 +85,11 @@ export class SquashSystem {
     this._cAy = new Float32Array(cap);
     this._cAz = new Float32Array(cap);
     this._cSeed = new Int32Array(cap);
+    this._cEpoch = new Int32Array(cap);
 
     this.strandKey = new Array(scap).fill('');
     this.strandHandle = new Int32Array(scap).fill(-1);
+    this.strandEpoch = new Int32Array(scap);
     this.strandCount = 0;
     this._strandHead = 0;                    // oldest wreck, evicted first
 
@@ -124,6 +127,7 @@ export class SquashSystem {
     this.t[i] = 0;
     this.phase[i] = 0;
     this.wreck[i] = 0;
+    this.epoch[i] = this.props.epoch;
     this.seed[i] = this._nextSeed = (this._nextSeed + 0x9e3779b1) | 0;
 
     // Write the uncrushed pose immediately. The streamer placed this instance, but a
@@ -147,7 +151,8 @@ export class SquashSystem {
         // Full crush was on screen last frame; retire the slot now.
         if (this.wreck[i]) {
           this._strand(this.key[i], this.handle[i], this.x[i], this.y[i], this.z[i],
-            this.rotY[i], this.scale[i], this.ax[i], this.ay[i], this.az[i], this.seed[i]);
+            this.rotY[i], this.scale[i], this.ax[i], this.ay[i], this.az[i], this.seed[i],
+            this.epoch[i]);
         } else {
           const j = c.count++;
           c.key[j] = this.key[i];
@@ -155,7 +160,7 @@ export class SquashSystem {
           c.x[j] = this.x[i]; c.y[j] = this.y[i]; c.z[j] = this.z[i];
           c.rotY[j] = this.rotY[i]; c.scale[j] = this.scale[i];
           this._cAx[j] = this.ax[i]; this._cAy[j] = this.ay[i]; this._cAz[j] = this.az[i];
-          this._cSeed[j] = this.seed[i];
+          this._cSeed[j] = this.seed[i]; this._cEpoch[j] = this.epoch[i];
         }
         continue;
       }
@@ -200,7 +205,7 @@ export class SquashSystem {
     for (let j = 0; j < c.count; j++) {
       if (c.handle[j] === handle && c.key[j] === key) {
         this._strand(key, handle, c.x[j], c.y[j], c.z[j], c.rotY[j], c.scale[j],
-          this._cAx[j], this._cAy[j], this._cAz[j], this._cSeed[j]);
+          this._cAx[j], this._cAy[j], this._cAz[j], this._cSeed[j], this._cEpoch[j]);
         return true;
       }
     }
@@ -208,13 +213,19 @@ export class SquashSystem {
   }
 
   reset() {
+    // Only hand back handles that are still ours. If the renderer was reset first —
+    // which is what Game.reset does, streamer before squash — every slot we hold has
+    // already been reclaimed AND reissued to a fresh prop, and freeing it here would
+    // hide that prop and put its instance in the free list a second time. The epoch
+    // is the only thing that can tell those two cases apart; `used` cannot.
+    const now = this.props.epoch;
     for (let i = 0; i < this.count; i++) {
-      this.props.free(this.key[i], this.handle[i]);
+      if (this.epoch[i] === now) this.props.free(this.key[i], this.handle[i]);
       this.handle[i] = -1;
     }
     this.count = 0;
     for (let i = 0; i < this.strandCount; i++) {
-      this.props.free(this.strandKey[i], this.strandHandle[i]);
+      if (this.strandEpoch[i] === now) this.props.free(this.strandKey[i], this.strandHandle[i]);
       this.strandHandle[i] = -1;
     }
     this.strandCount = 0;
@@ -232,7 +243,7 @@ export class SquashSystem {
    * driven over stays flatter than one caught mid-crumple — and then never costs
    * another instruction: its matrices are written here, once.
    */
-  _strand(key, handle, x, y, z, rotY, scale, ax, ay, az, seed) {
+  _strand(key, handle, x, y, z, rotY, scale, ax, ay, az, seed, epoch) {
     const D = TUNING.destruction;
     this.props.crush(key, handle, x, y, z, rotY, scale, ax, ay, az,
       1, D.squashStrandCompression, seed);
@@ -243,11 +254,14 @@ export class SquashSystem {
     } else {
       // Oldest first, and far enough behind the player that nobody sees it go.
       slot = this._strandHead;
-      this.props.free(this.strandKey[slot], this.strandHandle[slot]);
+      if (this.strandEpoch[slot] === this.props.epoch) {
+        this.props.free(this.strandKey[slot], this.strandHandle[slot]);
+      }
       this._strandHead = (this._strandHead + 1) % this.strandKey.length;
     }
     this.strandKey[slot] = key;
     this.strandHandle[slot] = handle;
+    this.strandEpoch[slot] = epoch;
   }
 
   _move(i, w) {
@@ -257,7 +271,7 @@ export class SquashSystem {
     this.rotY[w] = this.rotY[i]; this.scale[w] = this.scale[i];
     this.ax[w] = this.ax[i]; this.ay[w] = this.ay[i]; this.az[w] = this.az[i];
     this.dur[w] = this.dur[i]; this.t[w] = this.t[i];
-    this.seed[w] = this.seed[i];
+    this.seed[w] = this.seed[i]; this.epoch[w] = this.epoch[i];
     this.phase[w] = this.phase[i];
     this.wreck[w] = this.wreck[i];
   }

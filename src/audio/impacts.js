@@ -96,6 +96,14 @@ for (let i = 0; i < IMPACT_MATERIALS.length; i++) {
 const BLOCKED_KEY = 'impact.blocked';
 const SUB_KEY = 'impact.sub';
 
+/**
+ * The six zone tiers of §7, in zone order, as bank materials. `playFirstTaste`
+ * indexes this; it is the only place in the audio system that knows a zone
+ * number, and it is here rather than in the caller so the six tier signatures
+ * §11 asks for have one definition.
+ */
+export const TIER_MATERIALS = ['glass', 'wood', 'metal', 'car', 'heavy', 'structure'];
+
 export class ImpactPlayer {
   constructor(engine, bank) {
     this.engine = engine;
@@ -116,9 +124,29 @@ export class ImpactPlayer {
     /** Decaying estimate of how many impacts are landing per ~densityTau. */
     this._density = 0;
     this._densityTime = -1e9;
+
+    /** 0..1 — how much of the mix the shredding roar currently owns (§5). */
+    this._shredMix = 0;
+    this._winSecondary = 0;
+  }
+
+  /**
+   * How far the continuous roar has taken over (0 = discrete hits, 1 = fully
+   * shredding). Above `shredSuppressAt` an ordinary paper hit stops firing its
+   * own layers entirely: the roar is already carrying it, and twenty transients
+   * a second under a roar is exactly the mud §5 exists to remove.
+   *
+   * A PLOW, a BLOCK, and anything at or above `shredPunchShare` of the player's
+   * weight are never ducked — the roar is the texture, and the things that
+   * actually cost or nearly cost you something still have to punch through it.
+   */
+  setShredMix(mix01) {
+    this._shredMix = mix01 > 0 ? (mix01 < 1 ? mix01 : 1) : 0;
   }
 
   reset() {
+    this._shredMix = 0;
+    this._winSecondary = 0;
     this._windowStart = -1e9;
     this._winCount = 0;
     this._winTransient = 0;
@@ -140,6 +168,7 @@ export class ImpactPlayer {
     this._winBody = 0;
     this._winDebris = 0;
     this._winMaxWeight = 0;
+    this._winSecondary = 0;
   }
 
   /**
@@ -202,6 +231,13 @@ export class ImpactPlayer {
     const dominant = objW > this._winMaxWeight * 2;
     if (objW > this._winMaxWeight) this._winMaxWeight = objW;
 
+    // ── §5: hand this hit to the roar if the roar has taken over.
+    let shredScale = 1;
+    if (!plow && this._shredMix > 0 && objW < pW * A.shredPunchShare) {
+      if (this._shredMix >= A.shredSuppressAt) return;
+      shredScale = 1 - this._shredMix;
+    }
+
     // ── pitch: down with player weight, down with object weight
     const weightRate = Math.pow(TUNING.player.startWeight / pW, A.weightPitchExp);
     const objRate = Math.pow(A.objectPitchRef / Math.max(30, objW), A.objectPitchExp);
@@ -210,7 +246,7 @@ export class ImpactPlayer {
 
     // ── crowd scaling
     const crowd = 1 / Math.pow(count, A.impactCrowdExp);
-    const outGain = plow ? A.plowGainScale : 1;
+    const outGain = (plow ? A.plowGainScale : 1) * shredScale;
 
     // ── 1. transient
     if (dominant || this._winTransient < A.maxLayerVoices) {
@@ -236,7 +272,9 @@ export class ImpactPlayer {
     }
 
     // ── 3. sub (one live voice, swelling)
-    this._playSub(now, pW, inten, panC, plow ? 0.9 : 1);
+    // The roar has its own continuous low end driven by mass/second, so the
+    // per-hit sub gets out of its way rather than beating against it.
+    this._playSub(now, pW, inten, panC, (plow ? 0.9 : 1) * shredScale);
 
     // ── 4. debris tail
     const budget = A.debrisWindowMax - this._winDebris;
@@ -244,8 +282,11 @@ export class ImpactPlayer {
       const want = Math.round(lerp(A.debrisCountMin, A.debrisCountMax, clamp01(intensity01)));
       let n = want < budget ? want : budget;
       if (plow) n = Math.max(1, Math.round(n * 0.6));
+      // Debris is the first thing to turn to gravel soup, so it is the first
+      // thing the roar takes over completely.
+      if (shredScale < 0.55) n = 0;
       if (busy > 0) n = Math.max(1, Math.round(n * (1 - A.densityDebrisCut * busy)));
-      const dGain = A.debrisGain * inten * crowd * (plow ? 0.55 : 1);
+      const dGain = A.debrisGain * inten * crowd * (plow ? 0.55 : 1) * shredScale;
       const key = KEYS[mat].debris;
       for (let i = 0; i < n; i++) {
         this._winDebris++;
@@ -308,6 +349,69 @@ export class ImpactPlayer {
     this._subBase = base;
     this._subTime = now;
     this._subCount = 1;
+  }
+
+  /**
+   * §17 secondary destruction — a fragment of the thing you just hit killing
+   * something else on its way out.
+   *
+   * It must read as a CONSEQUENCE of the first hit and never as a second hit,
+   * which is three things: it is quieter, it is TIGHTER (the transient is
+   * clipped to `secondaryClip`, so there is a contact and no body behind it),
+   * and it arrives `secondaryDelay` after the event that caused it. It gets no
+   * body layer, no sub and no duck — the low end belongs to the parent impact,
+   * and a chain of these must never pump the mix.
+   *
+   * @param {string} materialKey the SECONDARY object's sound
+   * @param {number} objectWeight kg of the secondary object
+   * @param {number} playerWeight kg
+   * @param {number} pan -1..1
+   */
+  playSecondary(materialKey, objectWeight, playerWeight, pan) {
+    const eng = this.engine;
+    if (!eng.ready) return;
+    const A = TUNING.audio;
+    const now = eng.now;
+
+    // Under a shredding roar these are by definition inaudible, and they are
+    // the cheapest thing to drop.
+    if (this._shredMix >= A.shredSuppressAt) return;
+
+    if (now - this._windowStart > A.impactWindow) this._openWindow(now);
+    if (this._winSecondary >= A.secondaryWindowMax) return;
+    this._winSecondary++;
+
+    const objW = objectWeight > 0 && isFinite(objectWeight) ? objectWeight : 60;
+    const pW = playerWeight > 0 ? playerWeight : TUNING.player.startWeight;
+    const mat = resolveMaterial(materialKey, objW);
+    const panC = clamp(pan, -1, 1);
+    const shred = 1 - this._shredMix;
+
+    const weightRate = Math.pow(TUNING.player.startWeight / pW, A.weightPitchExp);
+    const objRate = Math.pow(A.objectPitchRef / Math.max(30, objW), A.objectPitchExp);
+    const rate = clamp(weightRate * objRate * A.secondaryRateScale, A.rateMin, A.rateMax);
+    const when = now + A.secondaryDelay + fxRng.next() * A.secondaryJitter;
+
+    resetParams(P);
+    P.bus = 'sfx';
+    P.gain = A.transientGain * A.secondaryGain * shred * (0.7 + 0.3 * fxRng.next());
+    P.rate = rate * (1 + fxRng.spread(A.pitchJitter));
+    P.pan = panC;
+    P.when = when;
+    P.duration = A.secondaryClip;   // the tightening — a contact with no body
+    this.bank.play(eng, KEYS[mat].transient, P);
+
+    const budget = A.debrisWindowMax - this._winDebris;
+    if (budget > 0) {
+      this._winDebris++;
+      resetParams(P);
+      P.bus = 'sfx';
+      P.gain = A.debrisGain * A.secondaryGain * shred * (0.5 + fxRng.next() * 0.5);
+      P.rate = rate * (1 + fxRng.spread(A.pitchJitter * 1.5));
+      P.pan = clamp(panC + fxRng.spread(0.5), -1, 1);
+      P.when = when + A.debrisDelay * 0.5 + fxRng.next() * A.debrisTailWindow * 0.4;
+      this.bank.play(eng, KEYS[mat].debris, P);
+    }
   }
 
   /** Standalone sub hit (landings, the house, a big absorb). */

@@ -128,6 +128,96 @@ export function makeLoopBuffer(ctx, seconds, channels, seed, pink) {
   return out;
 }
 
+/**
+ * The shredding roar's source material (§5). A seamless loop of dense, irregular
+ * crunch grains over a quiet bed — a hundred objects a second going through the
+ * drum, with none of them individually identifiable.
+ *
+ * It is built in plain JS rather than rendered offline for two reasons: it costs
+ * nothing at init (the loading bar is already long enough), and the grain rate
+ * has to survive `playbackRate` being pushed around at runtime, which a bank of
+ * one-shots cannot do. Grains WRAP past the end of the buffer, so the loop point
+ * is inaudible even though nothing is crossfaded over it.
+ *
+ * @param {number} density grains per second at playbackRate 1
+ */
+export function makeShredLoopBuffer(ctx, seconds, seed, density) {
+  const sr = ctx.sampleRate;
+  const n = Math.max(2048, Math.floor(sr * seconds));
+  const bed = makeLoopBuffer(ctx, n / sr, 1, seed ^ 0x5c1a, true);
+  const out = ctx.createBuffer(1, n, sr);
+  const d = out.getChannelData(0);
+  const b = bed.getChannelData(0);
+  for (let i = 0; i < n; i++) d[i] = b[i] * 0.28;
+
+  const rng = new Rng((seed >>> 0) ^ 0x9e3779b9);
+  const grains = Math.max(1, Math.floor((density > 0 ? density : 60) * seconds));
+  for (let g = 0; g < grains; g++) {
+    const start = Math.floor(rng.next() * n);
+    const tau = 0.0025 + rng.next() * rng.next() * 0.016;   // mostly short, a few long
+    const len = Math.min(n, Math.floor(tau * 7 * sr));
+    const amp = 0.35 + rng.next() * rng.next() * 1.2;
+    // Each grain gets its own one-pole band: the colour spread across grains is
+    // what stops the sum reading as flat noise.
+    const lpK = Math.exp(-2 * Math.PI * (900 + rng.next() * 5200) / sr);
+    const hpK = Math.exp(-2 * Math.PI * (60 + rng.next() * 320) / sr);
+    let lp = 0;
+    let hpPrev = 0;
+    let hpOut = 0;
+    const decay = Math.exp(-1 / (tau * sr));
+    let env = amp;
+    for (let i = 0; i < len; i++) {
+      const w = rng.next() * 2 - 1;
+      lp = lp * lpK + w * (1 - lpK);
+      hpOut = hpK * (hpOut + lp - hpPrev);
+      hpPrev = lp;
+      d[(start + i) % n] += hpOut * env;
+      env *= decay;
+    }
+  }
+
+  let peak = 0;
+  for (let i = 0; i < n; i++) { const a = d[i] < 0 ? -d[i] : d[i]; if (a > peak) peak = a; }
+  if (peak > 1e-4) { const k = 0.85 / peak; for (let i = 0; i < n; i++) d[i] *= k; }
+  return out;
+}
+
+/**
+ * Impulse response for the tunnel send (§17). Early reflections off close
+ * concrete walls, then a diffuse tail that darkens as it decays — a road tunnel
+ * is a hard box with a lot of absorption above 4 kHz, not a cathedral.
+ */
+export function makeReverbIr(ctx, seconds, decay, seed) {
+  const sr = ctx.sampleRate;
+  const n = Math.max(256, Math.floor(sr * seconds));
+  const buf = ctx.createBuffer(2, n, sr);
+  const rng = new Rng(seed >>> 0);
+  const k = decay > 0.05 ? decay : 0.45;
+  for (let c = 0; c < 2; c++) {
+    const d = buf.getChannelData(c);
+    // The tail's lowpass coefficient sweeps down over the decay, so the last
+    // reflections are duller than the first.
+    let lp = 0;
+    for (let i = 0; i < n; i++) {
+      const t = i / sr;
+      const env = Math.exp(-t / k) * (1 - i / n);
+      const a = 1 - Math.exp(-2 * Math.PI * (5200 * Math.exp(-t / (k * 1.5)) + 260) / sr);
+      lp += a * ((rng.next() * 2 - 1) - lp);
+      d[i] = lp * env;
+    }
+    // discrete early reflections: the two walls and the roof
+    const taps = [0.011, 0.019, 0.027, 0.041, 0.058];
+    for (let i = 0; i < taps.length; i++) {
+      const at = Math.floor((taps[i] + (c === 0 ? 0 : 0.0035)) * sr);
+      if (at < n) d[at] += (0.55 - i * 0.09) * (rng.bool() ? 1 : -1);
+    }
+    let peak = 0;
+    for (let i = 0; i < n; i++) { const a = d[i] < 0 ? -d[i] : d[i]; if (a > peak) peak = a; }
+    if (peak > 1e-4) { const g = 0.55 / peak; for (let i = 0; i < n; i++) d[i] *= g; }
+  }
+  return buf;
+}
+
 // ────────────────────────────────────────────────────────── synthesis helpers
 
 /** Filtered noise burst with an exponential percussive envelope. */
@@ -248,9 +338,11 @@ const MAT = {
       const n = 3 + Math.floor(rng.next() * 3);
       for (let i = 0; i < n; i++) {
         const t = t0 + rng.range(0, 0.32);
-        ping(octx, out, nb, t, 2400 + rng.range(0, 5000), 26, 0.10 + rng.range(0, 0.10), 0.30);
-        if (rng.bool(0.5)) {
-          tone(octx, out, t + 0.004, { type: 'sine', f0: 3200 + rng.range(0, 3600), dur: 0.14, gain: 0.10 });
+        // The glitter. This is the layer that has to keep the glass tier above
+        // the car tier's windscreen pings, so it reaches higher than they do.
+        ping(octx, out, nb, t, 3400 + rng.range(0, 5600), 26, 0.10 + rng.range(0, 0.10), 0.30);
+        if (rng.bool(0.6)) {
+          tone(octx, out, t + 0.004, { type: 'sine', f0: 4200 + rng.range(0, 4200), dur: 0.14, gain: 0.11 });
         }
       }
     },
@@ -265,8 +357,14 @@ const MAT = {
         dur: 0.045, gain: 0.95, type: 'bandpass', f0: 1500 + rng.spread(350), f1: 520,
         sweep: 0.03, q: 1.4, attack: 0.0007, offset: rng.next(),
       });
-      nz(octx, out, nb, t0, { dur: 0.02, gain: 0.55, type: 'highpass', f0: 2600, q: 0.7, offset: rng.next() });
-      tone(octx, out, t0, { type: 'triangle', f0: 320 + rng.spread(60), f1: 190, bend: 0.03, dur: 0.07, gain: 0.35 });
+      // The split of the grain. Dry means BAND-limited: an open highpass here
+      // put the wood tier's composite spectrum on top of glass, which is the
+      // one confusion §11 will not have.
+      nz(octx, out, nb, t0, {
+        dur: 0.02, gain: 0.42, type: 'bandpass', f0: 1900, q: 0.9,
+        type2: 'lowpass', f2: 2800, q2: 0.7, offset: rng.next(),
+      });
+      tone(octx, out, t0, { type: 'triangle', f0: 320 + rng.spread(60), f1: 190, bend: 0.03, dur: 0.07, gain: 0.35, lp: 2600 });
     },
     body(octx, out, nb, t0, rng) {
       nz(octx, out, nb, t0, { dur: 0.16, gain: 0.55, type: 'bandpass', f0: 640 + rng.spread(160), q: 1.1, attack: 0.002, offset: rng.next() });
@@ -278,47 +376,83 @@ const MAT = {
       const n = 3 + Math.floor(rng.next() * 3);
       for (let i = 0; i < n; i++) {
         const t = t0 + rng.range(0, 0.18);
-        nz(octx, out, nb, t, { dur: 0.05, gain: 0.42, type: 'bandpass', f0: 500 + rng.range(0, 900), q: 2.2, offset: rng.next() });
-        tone(octx, out, t, { type: 'triangle', f0: 200 + rng.range(0, 260), dur: 0.05, gain: 0.14 });
+        // Splinters, not shards: the second lowpass is what keeps them dry. A
+        // Q 2.2 bandpass leaks most of the noise floor straight through, which
+        // is why the wood TIER measured as bright as glass before this stage.
+        nz(octx, out, nb, t, {
+          dur: 0.05, gain: 0.42, type: 'bandpass', f0: 460 + rng.range(0, 620), q: 2.2,
+          type2: 'lowpass', f2: 1250, q2: 0.7, offset: rng.next(),
+        });
+        tone(octx, out, t, { type: 'triangle', f0: 200 + rng.range(0, 260), dur: 0.05, gain: 0.14, lp: 2000 });
       }
     },
   },
 
+  // Zone 3's furniture tier. The brief is a HOLLOW CLANG — a phone booth, a
+  // vending machine, a kiosk: a big empty box that rings dull. It used to be a
+  // bright ping whose composite centroid landed within 10 % of glass, which is
+  // the one thing §11 says must never happen, so the top two modal partials are
+  // gone, the transient's sparkle is lowpassed off, and a pipe resonance
+  // (odd harmonics of an air column) carries the ring instead.
   metal: {
     dur: [0.16, 1.85, 0.70],
-    norm: [0.92, 0.85, 0.60],   // peak each variant is normalised to
+    // The body is normalised higher than any other material's: the RING is the
+    // whole identity of this tier, and it has to still be above -40 dB of the
+    // composite a full second after the contact or furniture measures as dry
+    // as wood.
+    norm: [0.92, 0.94, 0.60],
     transient(octx, out, nb, t0, rng) {
-      nz(octx, out, nb, t0, { dur: 0.035, gain: 0.9, type: 'highpass', f0: 2200, q: 0.7, attack: 0.0005, offset: rng.next() });
-      nz(octx, out, nb, t0, { dur: 0.06, gain: 0.6, type: 'bandpass', f0: 3600 + rng.spread(900), q: 3.5, offset: rng.next() });
-      tone(octx, out, t0, { type: 'square', f0: 900 + rng.spread(200), f1: 420, bend: 0.02, dur: 0.05, gain: 0.22, lp: 5000 });
+      nz(octx, out, nb, t0, {
+        dur: 0.040, gain: 0.95, type: 'bandpass', f0: 1150 + rng.spread(220), q: 1.1,
+        type2: 'lowpass', f2: 2600, q2: 0.7, attack: 0.0006, offset: rng.next(),
+      });
+      // the box wall going in — a bonk, not a click
+      tone(octx, out, t0, { type: 'square', f0: 520 + rng.spread(90), f1: 250, bend: 0.025, dur: 0.06, gain: 0.34, lp: 1800 });
+      // a whisper of edge, so it still reads as sheet steel rather than a drum
+      nz(octx, out, nb, t0, { dur: 0.016, gain: 0.05, type: 'highpass', f0: 3400, q: 0.7, attack: 0.0005, offset: rng.next() });
     },
     body(octx, out, nb, t0, rng) {
-      const base = 300 + rng.range(0, 260);
-      for (let i = 0; i < METAL_RATIOS.length; i++) {
+      const base = 186 + rng.range(0, 90);
+      // Only the first three modal partials survive: 8.93 and 13.7 are what made
+      // this bank measure like broken glass.
+      for (let i = 0; i < 3; i++) {
         const f = base * METAL_RATIOS[i] * (1 + rng.spread(0.02));
         // the twang: every partial starts sharp and settles
         tone(octx, out, t0 + i * 0.0015, {
           type: 'sine', f0: f * 1.06, f1: f, bend: 0.05 + i * 0.01,
-          dur: (1.7 - i * 0.2) * rng.range(0.75, 1.05),
-          gain: 0.26 / (1 + i * 0.42), attack: 0.002,
+          dur: (1.80 - i * 0.22) * rng.range(0.80, 1.05),
+          gain: 0.30 / (1 + i * 0.42), attack: 0.002, lp: 2400,
         });
         // slight detune partner → slow beating, reads as "big sheet"
-        if (i < 3) {
-          tone(octx, out, t0, {
-            type: 'sine', f0: f * 1.004, dur: (1.4 - i * 0.25), gain: 0.10 / (1 + i), attack: 0.006,
-          });
-        }
+        tone(octx, out, t0, {
+          type: 'sine', f0: f * 1.004, dur: (1.4 - i * 0.25), gain: 0.11 / (1 + i), attack: 0.006,
+        });
       }
-      nz(octx, out, nb, t0, { dur: 0.30, gain: 0.26, type: 'bandpass', f0: 2600, q: 1.2, attack: 0.002, offset: rng.next() });
+      // the hollow: odd harmonics of the air column inside the box, which is
+      // the difference between a struck plate and a struck cabinet
+      const pipe = 132 + rng.range(0, 44);
+      for (let i = 0; i < 3; i++) {
+        tone(octx, out, t0 + 0.004, {
+          type: 'sine', f0: pipe * (1 + i * 2), dur: 1.72 - i * 0.30,
+          gain: 0.26 / (1 + i * 1.3), attack: 0.008, lp: 1500,
+        });
+      }
+      nz(octx, out, nb, t0, {
+        dur: 0.30, gain: 0.30, type: 'bandpass', f0: 900, q: 1.0,
+        type2: 'lowpass', f2: 1700, q2: 0.7, attack: 0.002, offset: rng.next(),
+      });
     },
     debris(octx, out, nb, t0, rng) {
       const n = 2 + Math.floor(rng.next() * 3);
       for (let i = 0; i < n; i++) {
         const t = t0 + rng.range(0, 0.4);
-        const f = 420 + rng.range(0, 1500);
-        tone(octx, out, t, { type: 'sine', f0: f * 1.05, f1: f, bend: 0.03, dur: 0.22, gain: 0.24 });
-        tone(octx, out, t, { type: 'sine', f0: f * 2.76, dur: 0.16, gain: 0.11 });
-        nz(octx, out, nb, t, { dur: 0.03, gain: 0.3, type: 'highpass', f0: 3000, offset: rng.next() });
+        const f = 260 + rng.range(0, 620);
+        tone(octx, out, t, { type: 'sine', f0: f * 1.05, f1: f, bend: 0.03, dur: 0.24, gain: 0.26, lp: 1600 });
+        tone(octx, out, t, { type: 'sine', f0: f * 2.76, dur: 0.14, gain: 0.07, lp: 2200 });
+        nz(octx, out, nb, t, {
+          dur: 0.035, gain: 0.30, type: 'bandpass', f0: 700 + rng.range(0, 500), q: 1.4,
+          type2: 'lowpass', f2: 1500, q2: 0.7, offset: rng.next(),
+        });
       }
     },
   },
@@ -328,8 +462,13 @@ const MAT = {
     norm: [0.92, 0.88, 0.55],   // peak each variant is normalised to
     transient(octx, out, nb, t0, rng) {
       // broadband crunch — sheet metal folding
-      nz(octx, out, nb, t0, { dur: 0.09, gain: 0.95, type: 'bandpass', f0: 900 + rng.spread(200), q: 0.5, attack: 0.0008, offset: rng.next() });
-      nz(octx, out, nb, t0, { dur: 0.05, gain: 0.6, type: 'highpass', f0: 3200, q: 0.7, offset: rng.next() });
+      nz(octx, out, nb, t0, { dur: 0.09, gain: 0.95, type: 'bandpass', f0: 780 + rng.spread(180), q: 0.5, attack: 0.0008, offset: rng.next() });
+      // a rim of glass at the top of the crunch, capped: unfiltered air up here
+      // is what used to make a sedan measure as bright as a greenhouse
+      nz(octx, out, nb, t0, {
+        dur: 0.05, gain: 0.30, type: 'bandpass', f0: 3000, q: 0.8,
+        type2: 'lowpass', f2: 4800, q2: 0.7, offset: rng.next(),
+      });
       tone(octx, out, t0, { type: 'sine', f0: 150, f1: 62, bend: 0.06, dur: 0.16, gain: 0.6 });
     },
     body(octx, out, nb, t0, rng) {
@@ -337,9 +476,11 @@ const MAT = {
       tone(octx, out, t0, { type: 'sine', f0: 96, f1: 52, bend: 0.10, dur: 0.42, gain: 0.55 });
       // crunching mid
       nz(octx, out, nb, t0 + 0.005, { dur: 0.34, gain: 0.42, type: 'bandpass', f0: 620, f1: 300, sweep: 0.25, q: 0.8, attack: 0.003, offset: rng.next() });
-      // the glass sub-layer inside the car
-      for (let i = 0; i < 4; i++) {
-        ping(octx, out, nb, t0 + rng.range(0.01, 0.22), 2600 + rng.range(0, 3800), 24, 0.16, 0.16);
+      // The glass sub-layer inside the car. §11 asks for it explicitly, but it
+      // is a windscreen inside a crushing shell, not a greenhouse: three pings,
+      // an octave below the glass tier's, or the two tiers converge.
+      for (let i = 0; i < 3; i++) {
+        ping(octx, out, nb, t0 + rng.range(0.01, 0.22), 2100 + rng.range(0, 2300), 24, 0.16, 0.15);
       }
       // panel resonance
       const base = 220 + rng.range(0, 90);
@@ -351,10 +492,14 @@ const MAT = {
       const n = 3 + Math.floor(rng.next() * 3);
       for (let i = 0; i < n; i++) {
         const t = t0 + rng.range(0, 0.34);
-        if (rng.bool(0.45)) {
-          ping(octx, out, nb, t, 2600 + rng.range(0, 3400), 26, 0.12, 0.26);
+        if (rng.bool(0.2)) {
+          ping(octx, out, nb, t, 1800 + rng.range(0, 1800), 26, 0.12, 0.22);
         } else {
-          nz(octx, out, nb, t, { dur: 0.07, gain: 0.34, type: 'bandpass', f0: 400 + rng.range(0, 900), q: 1.8, offset: rng.next() });
+          // the crunch: folding panel, not shattering pane
+          nz(octx, out, nb, t, {
+            dur: 0.07, gain: 0.36, type: 'bandpass', f0: 400 + rng.range(0, 800), q: 1.8,
+            type2: 'lowpass', f2: 2400, q2: 0.7, offset: rng.next(),
+          });
           tone(octx, out, t, { type: 'sine', f0: 180 + rng.range(0, 240), dur: 0.09, gain: 0.14 });
         }
       }
@@ -393,9 +538,14 @@ const MAT = {
       for (let i = 0; i < n; i++) {
         const t = t0 + rng.range(0, 0.55);
         const f = 120 + rng.range(0, 420);
-        tone(octx, out, t, { type: 'sine', f0: f * 1.06, f1: f, bend: 0.05, dur: 0.34, gain: 0.30 });
-        tone(octx, out, t, { type: 'sine', f0: f * 2.76, dur: 0.2, gain: 0.10 });
-        nz(octx, out, nb, t, { dur: 0.09, gain: 0.30, type: 'lowpass', f0: 700, q: 0.8, offset: rng.next() });
+        tone(octx, out, t, { type: 'sine', f0: f * 1.06, f1: f, bend: 0.05, dur: 0.34, gain: 0.30, lp: 1200 });
+        tone(octx, out, t, { type: 'sine', f0: f * 2.76, dur: 0.2, gain: 0.07, lp: 1600 });
+        // second pole pair: one lowpass leaves enough shoulder for the truck
+        // tier to measure brighter than the car tier, which is backwards
+        nz(octx, out, nb, t, {
+          dur: 0.09, gain: 0.30, type: 'lowpass', f0: 700, q: 0.8,
+          type2: 'lowpass', f2: 820, q2: 0.7, offset: rng.next(),
+        });
       }
     },
   },
@@ -453,9 +603,15 @@ const MAT = {
       for (let i = 0; i < n; i++) {
         const t = t0 + rng.range(0, 0.85);
         const f = 70 + rng.range(0, 190);
-        tone(octx, out, t, { type: 'sine', f0: f * 1.08, f1: f, bend: 0.07, dur: 0.42, gain: 0.34 });
-        nz(octx, out, nb, t, { dur: 0.16, gain: 0.34, type: 'lowpass', f0: 480, q: 0.8, offset: rng.next() });
-        nz(octx, out, nb, t + 0.02, { dur: 0.05, gain: 0.006, type: 'bandpass', f0: 700 + rng.range(0, 900), q: 2.0, offset: rng.next() });
+        tone(octx, out, t, { type: 'sine', f0: f * 1.08, f1: f, bend: 0.07, dur: 0.42, gain: 0.34, lp: 900 });
+        nz(octx, out, nb, t, {
+          dur: 0.16, gain: 0.34, type: 'lowpass', f0: 480, q: 0.8,
+          type2: 'lowpass', f2: 560, q2: 0.7, offset: rng.next(),
+        });
+        nz(octx, out, nb, t + 0.02, {
+          dur: 0.05, gain: 0.006, type: 'bandpass', f0: 700 + rng.range(0, 900), q: 2.0,
+          type2: 'lowpass', f2: 1400, q2: 0.7, offset: rng.next(),
+        });
       }
     },
   },
@@ -556,7 +712,7 @@ const MAT = {
  *   • a 210 Hz lowpass, swept down to 95 Hz inside 25 ms — no upper spectrum;
  *   • total decay under 60 ms — no body, no tail;
  *   • two short sine partials with no bend to speak of — it does not ring;
- *   • normalised to a lower peak than any impact layer — it is not a payoff.
+ *   • normalised to a lower peak than any impact transient — it is not a payoff.
  * `ImpactPlayer` also refuses it the sub layer and the debris tail, so a block
  * is the only event in the game with no low end and no scatter.
  */
@@ -761,6 +917,144 @@ function renderUiGameover(octx, out, nb, t0, rng) {
   nz(octx, out, nb, t0 + 1.2, { dur: 0.35, gain: 0.4, type: 'lowpass', f0: 420, q: 0.8, attack: 0.002, offset: rng.next() });
 }
 
+/**
+ * §17 — the fuel tanker going up. The biggest sound in the game that is not the
+ * house, and the only one built around a genuine explosion envelope: an
+ * ignition crack with almost no body, then 200 ms of nothing much, then the
+ * pressure wave arriving underneath it. The delay between the crack and the
+ * boom is most of what makes it read as an explosion rather than a big impact.
+ */
+function renderTanker(octx, out, nb, t0, rng) {
+  // the vapour catching — incandescent, and gone before you register it
+  nz(octx, out, nb, t0, { dur: 0.030, gain: 0.55, type: 'highpass', f0: 4600, q: 0.7, attack: 0.0004, offset: rng.next() });
+  nz(octx, out, nb, t0, { dur: 0.09, gain: 0.85, type: 'bandpass', f0: 2200 + rng.spread(400), q: 0.6, attack: 0.0006, offset: rng.next() });
+
+  // the pressure wave: a wall of noise collapsing three octaves in 400 ms
+  const boom = t0 + 0.016;
+  nz(octx, out, nb, boom, {
+    dur: 1.05, gain: 1.0, type: 'lowpass', f0: 3800, f1: 95, sweep: 0.40, q: 0.9,
+    attack: 0.004, offset: rng.next(),
+  });
+  tone(octx, out, boom, { type: 'sine', f0: 62, f1: 23, bend: 0.55, dur: 2.10, gain: 1.0, attack: 0.005 });
+  tone(octx, out, boom, { type: 'sine', f0: 39, f1: 19, bend: 1.30, dur: 2.45, gain: 0.72, attack: 0.02 });
+
+  // the shell letting go — the tank is still a 6 t steel cylinder
+  const base = 112 + rng.range(0, 34);
+  for (let i = 0; i < 4; i++) {
+    const f = base * HEAVY_RATIOS[i];
+    tone(octx, out, boom + i * 0.012, {
+      type: 'sine', f0: f * 1.07, f1: f * 0.88, bend: 1.1, dur: 1.35 - i * 0.24,
+      gain: 0.24 / (1 + i * 0.6), attack: 0.008, lp: 1400,
+    });
+  }
+
+  // the fireball: swells AFTER the crack, which is the whole read
+  nz(octx, out, nb, boom + 0.05, {
+    dur: 1.60, gain: 0.46, type: 'lowpass', f0: 620, f1: 130, sweep: 1.1, q: 0.7,
+    type2: 'lowpass', f2: 760, q2: 0.6, attack: 0.10, offset: rng.next(),
+  });
+
+  // everything that was bolted to it, coming back down
+  for (let i = 0; i < 12; i++) {
+    const t = t0 + rng.range(0.18, 2.30);
+    nz(octx, out, nb, t, {
+      dur: 0.06 + rng.range(0, 0.06), gain: 0.05, type: 'bandpass',
+      f0: 380 + rng.range(0, 1700), q: 1.8, type2: 'lowpass', f2: 2600, q2: 0.7, offset: rng.next(),
+    });
+    if (rng.bool(0.4)) {
+      tone(octx, out, t, { type: 'sine', f0: 150 + rng.range(0, 420), dur: 0.16, gain: 0.05, lp: 1200 });
+    }
+  }
+}
+
+/**
+ * §17 — a car horn, for the scatter. Two reeds a minor third apart, which is
+ * what an actual horn is, and the beat between the detuned pair is what makes
+ * it read as panic rather than as a note. Deliberately mid-band and thin: this
+ * is traffic texture and it must never compete with a smash.
+ */
+function renderHorn(octx, out, nb, t0, rng) {
+  const f = 372 + rng.spread(26);
+  const pair = [1, 1.19];   // ~minor third
+  for (let i = 0; i < pair.length; i++) {
+    const hz = f * pair[i];
+    tone(octx, out, t0, {
+      type: 'sawtooth', f0: hz, dur: 0.62, gain: 0.30 / (1 + i * 0.4),
+      lp: 2200, lpq: 0.8, attack: 0.008, hold: 0.34,
+    });
+    // the second reed, a few cents off, so the pair beats
+    tone(octx, out, t0, {
+      type: 'square', f0: hz * 1.006, dur: 0.58, gain: 0.13 / (1 + i * 0.5),
+      lp: 1700, attack: 0.012, hold: 0.30,
+    });
+  }
+  // the air behind the diaphragm
+  nz(octx, out, nb, t0, {
+    dur: 0.05, gain: 0.10, type: 'bandpass', f0: 1400, q: 1.2,
+    type2: 'lowpass', f2: 2600, q2: 0.7, attack: 0.004, offset: rng.next(),
+  });
+}
+
+/**
+ * §17 — locked tyres. A squeal is a stack of near-identical high-Q bands that
+ * drift apart, not one tone: six of them here, each with its own drift, over a
+ * low scrub bed. Short, because it is a reaction to you arriving, not an event.
+ */
+function renderBrake(octx, out, nb, t0, rng) {
+  for (let i = 0; i < 6; i++) {
+    const f0 = 1450 + rng.range(0, 900);
+    nz(octx, out, nb, t0 + rng.range(0, 0.09), {
+      dur: 0.34 + rng.range(0, 0.22), gain: 0.30 - i * 0.03,
+      type: 'bandpass', f0: f0, f1: f0 * rng.range(1.04, 1.22), sweep: 0.30, q: 14,
+      attack: 0.012 + rng.range(0, 0.03), offset: rng.next(),
+    });
+  }
+  // rubber on tarmac under the squeal
+  nz(octx, out, nb, t0, {
+    dur: 0.46, gain: 0.34, type: 'lowpass', f0: 420, f1: 240, sweep: 0.36, q: 0.7,
+    attack: 0.02, offset: rng.next(),
+  });
+  nz(octx, out, nb, t0 + 0.02, { dur: 0.14, gain: 0.10, type: 'bandpass', f0: 780, q: 1.4, offset: rng.next() });
+}
+
+/**
+ * §17 — the first-taste stinger: the audio half of the one-time slow-motion
+ * close-up the first time the player meets a tier. A short rise, then a stab
+ * that lands with the freeze. It is rendered once and TRANSPOSED per tier, with
+ * that tier's own body bank stamped underneath it at the call site — a stinger
+ * per tier would be six more banks for one event each per run.
+ */
+function renderStinger(octx, out, nb, t0, rng) {
+  // the rise: 180 ms of air being pulled in
+  nz(octx, out, nb, t0, {
+    dur: 0.20, gain: 0.34, type: 'bandpass', f0: 420, f1: 2600, sweep: 0.19, q: 1.1,
+    attack: 0.16, offset: rng.next(),
+  });
+
+  const hit = t0 + 0.20;
+  // the stab: a low cluster with the filter snapping shut on it
+  const root = 116;
+  const voices = [1, 1.5, 2, 3];
+  for (let i = 0; i < voices.length; i++) {
+    tone(octx, out, hit, {
+      type: 'sawtooth', f0: root * voices[i] * (1 + rng.spread(0.004)),
+      dur: 0.80 - i * 0.11, gain: 0.30 / (1 + i * 0.7),
+      lp: 3000, lp1: 380, attack: 0.004, hold: 0.05,
+    });
+  }
+  tone(octx, out, hit, { type: 'sine', f0: 58, f1: 41, bend: 0.30, dur: 0.85, gain: 0.85, attack: 0.004 });
+  // the edge on the stab — bright, but capped, so it stamps rather than hisses
+  nz(octx, out, nb, hit, {
+    dur: 0.07, gain: 0.30, type: 'bandpass', f0: 2600, q: 1.6,
+    type2: 'lowpass', f2: 5200, q2: 0.7, attack: 0.0008, offset: rng.next(),
+  });
+  // the room it happens in
+  nz(octx, out, nb, hit + 0.03, {
+    dur: 0.62, gain: 0.14, type: 'lowpass', f0: 900, f1: 220, sweep: 0.5, q: 0.8,
+    attack: 0.05, offset: rng.next(),
+  });
+}
+
 // ─────────────────────────────────────────────────────────────── bank plumbing
 
 /** Single-buffer (non-material) bank keys, in render order. */
@@ -768,7 +1062,33 @@ export const SINGLE_KEYS = [
   'impact.sub', 'impact.blocked', 'combo.ding', 'absorb.coin', 'absorb.till',
   'strike.alarm', 'house.win', 'house.hold', 'jump.whoosh', 'land.thud',
   'ui.click', 'ui.hover', 'ui.start', 'ui.gameover',
+  'tanker.blast', 'traffic.horn', 'traffic.brake', 'taste.stinger',
 ];
+
+/**
+ * Variant count overrides, per bank key.
+ *
+ * `variantsPerLayer` is 5 and that is right for the layers that fire twenty
+ * times a zone. It is not right for the two longest banks in the game: the
+ * structure and heavy bodies are 3.2 s and 2.55 s each, they only ever play for
+ * the top rungs of the last two zones' landmark ladders, and at five variants
+ * apiece they were 16 s and 12.75 s of the init render on their own. Trimming
+ * them paid for every §17 bank below with time to spare — see README.md for the
+ * before/after numbers. The no-repeat rule still applies, so three variants is
+ * still never the same sound twice running.
+ */
+const VARIANT_CAP = Object.create(null);
+VARIANT_CAP['impact.structure.body'] = 3;
+VARIANT_CAP['impact.structure.debris'] = 4;
+VARIANT_CAP['impact.heavy.body'] = 4;
+VARIANT_CAP['impact.heavy.debris'] = 4;
+VARIANT_CAP['impact.metal.body'] = 4;
+VARIANT_CAP['impact.glass.body'] = 4;
+// One prop in a 51-prop catalogue is tagged `water`. Five variants of a bank
+// that fires a handful of times in a run was 7.5 s of the loading bar.
+VARIANT_CAP['impact.water.transient'] = 3;
+VARIANT_CAP['impact.water.body'] = 3;
+VARIANT_CAP['impact.water.debris'] = 3;
 
 /** The full key list. Also the manifest key space for `registerSamples`. */
 export function bankKeys() {
@@ -790,9 +1110,11 @@ function buildJobs() {
     const def = MAT[key];
     for (let l = 0; l < IMPACT_LAYERS.length; l++) {
       const layer = IMPACT_LAYERS[l];
+      const bankKey = 'impact.' + key + '.' + layer;
+      const cap = VARIANT_CAP[bankKey];
       jobs.push({
-        key: 'impact.' + key + '.' + layer,
-        count: variants,
+        key: bankKey,
+        count: cap !== undefined && cap < variants ? cap : variants,
         dur: def.dur[l],
         norm: def.norm[l],
         seed: 0x5eed0000 + m * 977 + l * 31,
@@ -801,8 +1123,9 @@ function buildJobs() {
     }
   }
   jobs.push({ key: 'impact.sub', count: Math.min(3, variants), dur: 0.80, norm: 0.95, seed: 0x51b0, fn: renderSub });
-  // Deliberately the lowest normalisation target in the game: a block is not a
-  // payoff, so it does not get to be as loud as one.
+  // Normalised below every impact transient: a block is not a payoff, so it does
+  // not get to arrive as loud as one. (The quiet debris layers sit lower still,
+  // but they only ever play as the tail of a hit that already landed.)
   jobs.push({ key: 'impact.blocked', count: 3, dur: 0.055, norm: 0.66, seed: 0xb10c, fn: renderBlocked });
   jobs.push({ key: 'combo.ding', count: 3, dur: 1.00, norm: 0.85, seed: 0xcb01, fn: renderCombo });
   jobs.push({ key: 'absorb.coin', count: 3, dur: 0.30, norm: 0.80, seed: 0x9cc4, fn: renderAbsorb });
@@ -816,6 +1139,12 @@ function buildJobs() {
   jobs.push({ key: 'ui.hover', count: 2, dur: 0.07, norm: 0.38, seed: 0x4e2a, fn: renderUiHover });
   jobs.push({ key: 'ui.start', count: 1, dur: 1.80, norm: 0.88, seed: 0x5f3b, fn: renderUiStart });
   jobs.push({ key: 'ui.gameover', count: 1, dur: 1.80, norm: 0.82, seed: 0x60c4, fn: renderUiGameover });
+  // ── §17. The blast is normalised above every impact layer and just under the
+  // house: it is the biggest thing on the highway and nothing else may be.
+  jobs.push({ key: 'tanker.blast', count: 2, dur: 2.80, norm: 0.96, seed: 0x7a11, fn: renderTanker });
+  jobs.push({ key: 'traffic.horn', count: 2, dur: 0.85, norm: 0.78, seed: 0x8c02, fn: renderHorn });
+  jobs.push({ key: 'traffic.brake', count: 2, dur: 0.72, norm: 0.70, seed: 0x8c03, fn: renderBrake });
+  jobs.push({ key: 'taste.stinger', count: 1, dur: 1.10, norm: 0.92, seed: 0x9f05, fn: renderStinger });
   return jobs;
 }
 
