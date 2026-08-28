@@ -344,6 +344,13 @@ export const TUNING = {
 
   // ─────────────────────────────────────────────────────────────── destruction
   destruction: {
+    // §17's domino wash. A destroyed object shoves nearby vehicles, which can strike
+    // others in turn — the traffic module measured 4.3 cascade links and 8.3 crash
+    // events per run at these values, which is a pileup often enough to be a story
+    // and rarely enough to stay readable.
+    washRadius: 9,
+    washStrength: 12,
+
     maxFragments: 250,
     fragmentLifePhysics: 1.5,
     fragmentLifeFade: 1.0,

@@ -24,6 +24,7 @@ import {
 import { TrackProfile } from '../world/track.js';
 import { buildTrackPlan, speedAtWeight } from '../world/trackplan.js';
 import { WorldStream } from '../world/generator.js';
+import { TrafficSystem, TRAFFIC_EVENT } from '../world/traffic.js';
 import { DebugOverlay } from './debug.js';
 import { MATERIALS, PROPS } from '../world/objects.js';
 
@@ -48,6 +49,8 @@ const OVER = 'over';
 
 /** Reused audio state — allocating this per frame would be 60 objects a second. */
 /** Reused debug counters — same reason as AS below. */
+const MERGED = [];   // reused view over both live lists; never reallocated
+
 const DBG = {
   visible: 0, near: 0, labels: 0, fragments: 0, crush: 0, wrecks: 0, decals: 0,
   gradeDeg: 0, weight: 0, speed: 0, zone: 0,
@@ -115,6 +118,7 @@ export class Game {
     this.particles = new ParticleSystem(scene);
     this.fragments = new FragmentSystem(scene, (x, z) => this.stream.groundYAt(x, z));
     this.squash = new SquashSystem(this.props);
+    this.traffic = new TrafficSystem(this.props, this.profile);
     this.decals = new DecalSystem(scene);
     this.outlines = new OutlineSystem(scene);
     this.house = new House(scene);
@@ -143,6 +147,7 @@ export class Game {
   _prepare(seed) {
     this.plan = buildTrackPlan(seed);
     this.stream.reset(this.plan);
+    this.traffic.reset(this.plan);
     this.player.reset();
     this.stream.update(0, this.player.weight);
     this.physics.step();
@@ -246,8 +251,9 @@ export class Game {
       target: TUNING.finale.houseWeight,
       medal,
       smashed: this.score.smashed,
-      missedWeight: Math.round(this.stream.missedWeight + this.stream.remainingWeight(this.player.d)),
-      missedCount: this.stream.missedCount,
+      missedWeight: Math.round(this.stream.missedWeight + this.stream.remainingWeight(this.player.d)
+        + this.traffic.missedWeight + this.traffic.remainingWeight(this.player.d)),
+      missedCount: this.stream.missedCount + this.traffic.missedCount,
       bestChain: this.score.bestChain,
       zonesCleared: this.stream.zoneIndex + (outcome === 'win' ? 1 : 0),
       time: this.runTime,
@@ -294,6 +300,43 @@ export class Game {
     return n;
   }
 
+  /**
+   * §17's scatter, heard. The traffic queue is a reused flat array valid only until
+   * the next update(), so it is drained every frame and never retained.
+   */
+  /**
+   * The plan's objects and the moving traffic as one list, for the systems that read
+   * "everything the player can hit" — outlines, labels, the object budget. Refills a
+   * module-scope array in place, so it costs one grow on the first busy frame and
+   * nothing after that.
+   */
+  _mergeLive() {
+    const m = MERGED;
+    let n = 0;
+    const a = this.stream.live;
+    for (let i = 0, an = this.stream.liveCount; i < an; i++) if (a[i].alive) m[n++] = a[i];
+    const b = this.traffic.live;
+    for (let i = 0, bn = this.traffic.liveCount; i < bn; i++) if (b[i].alive) m[n++] = b[i];
+    this._mergedCount = n;
+    return m;
+  }
+
+  _drainTrafficEvents() {
+    const ev = this.traffic.events;
+    if (!ev || !ev.count) return;
+    const half = TUNING.world.roadWidth * 0.5;
+    for (let i = 0; i < ev.count; i++) {
+      const pan = clamp(ev.x[i] / half, -1, 1);
+      const t = ev.type[i];
+      if (t === TRAFFIC_EVENT.HORN) audio.playScatter && audio.playScatter('horn', pan, ev.level[i]);
+      else if (t === TRAFFIC_EVENT.BRAKE) audio.playScatter && audio.playScatter('brake', pan, ev.level[i]);
+      else if (t === TRAFFIC_EVENT.CRASH) {
+        audio.playImpact('car', 'PLOW', ev.weight[i], this.player.weight, pan, 0.6);
+        this.chase.addTrauma(TUNING.shake.traumaClean * 0.4 * ev.level[i], this.player.weight);
+      }
+    }
+  }
+
   _applyVolume(kind, v) {
     const s = this.screens.getSettings();
     audio.setVolumes(kind === 'master' ? v : s.master, kind === 'sfx' ? v : s.sfx, kind === 'music' ? v : s.music);
@@ -316,6 +359,12 @@ export class Game {
     p.setInput(this.input.poll());
     p.step(dt);
     this.stream.update(p.d, p.weight);
+    // reserve() hands the streamer's usage to the traffic so the 12-visible /
+    // 5-near caps are a JOINT budget. Two independent shares would merely add up
+    // to twice the cap, which is exactly the clutter §6.1 exists to prevent.
+    this.traffic.reserve(this.stream.liveCount, this._nearBandCount(p));
+    this.traffic.update(dt, p.d, p.x, p.speed, p.weight);
+    this._drainTrafficEvents();
 
     if (p.landImpact > 0.02) {
       this.chase.addTrauma(TUNING.shake.traumaLanding * p.landImpact, p.weight);
@@ -348,10 +397,15 @@ export class Game {
   }
 
   _resolveCollisions(dt) {
-    const p = this.player;
-    const live = this.stream.live;
-    const n = this.stream.liveCount;
     this.frameImpacts = 0;
+    this._collideList(dt, this.stream.live, this.stream.liveCount);
+    // Traffic records carry the identical shape, so the same body handles both
+    // rather than a second, drifting copy of the contact rules.
+    this._collideList(dt, this.traffic.live, this.traffic.liveCount);
+  }
+
+  _collideList(dt, live, n) {
+    const p = this.player;
 
     for (let i = 0; i < n; i++) {
       const e = live[i];
@@ -416,6 +470,7 @@ export class Game {
       const clearZ = e.cz + e.ez + p.radius + 0.3;
       if (p.z < clearZ) { p.z = clearZ; p.d = -p.z; }
       const lost = p.blockedResponse();
+      this.traffic.shockwave(ix, iz, TUNING.destruction.washRadius * 0.6, TUNING.destruction.washStrength * 0.5);
       this.score.registerBlock();
       this.chase.addTrauma(TUNING.shake.traumaBlocked, p.weight);
       this.loop.requestHitstop(hitstopFor(e.weight, BLOCKED));
@@ -444,7 +499,11 @@ export class Game {
     const sqKey = e.key;
     const sqHandle = e.handle;
     e.handle = -1;
-    this.stream.consume(e);
+    if (e.moving) this.traffic.consume(e); else this.stream.consume(e);
+    // §17's domino: the wash off a destroyed object shoves nearby vehicles, which
+    // can strike others in turn. One hit becoming a six-car pileup is the moment
+    // players screenshot, and it costs one call.
+    this.traffic.shockwave(ix, iz, TUNING.destruction.washRadius, TUNING.destruction.washStrength);
     const isClean = outcome === CLEAN;
     if (!isClean) p.applySpeedLoss(TUNING.collision.plowSpeedLoss);
     p.absorb(e.weight);
@@ -639,7 +698,11 @@ export class Game {
       this.particles.disturb(ix, iz, p.radius * 2.2, 1);
       this.decals.addTrail(ix, p.groundY, iz, p.halfWidth, this.profile.slopeAt(p.d));
     }
-    this.outlines.update(rawDt, this.stream.live, this.stream.liveCount, p.weight, cam.position);
+    // ONE merged list, not two calls: both systems rebuild their instance buffer
+    // from scratch per call, so a second call would silently erase the first list's
+    // outlines and labels rather than adding to them.
+    const all = this._mergeLive();
+    this.outlines.update(rawDt, all, this._mergedCount, p.weight, cam.position);
     this.decor.update(p.d);
     this.house.update(scaledDt, this.houseResolved ? 'hold' : 'idle');
     this.props.flush();
@@ -655,7 +718,7 @@ export class Game {
     const total = this.plan ? this.plan.house.d : 1;
     this.hud.setProgress(clamp01(p.d / total), this.plan ? this.plan.zones : null, this.stream.zoneIndex);
     if (this.input.debugEdge) this.debug.toggle();
-    DBG.visible = this.stream.liveCount;
+    DBG.visible = this._mergedCount || this.stream.liveCount;
     DBG.near = this._nearBandCount(p);
     DBG.labels = this.labels.activeCount ?? 0;
     DBG.fragments = this.fragments.activeCount ?? 0;
@@ -668,7 +731,7 @@ export class Game {
 
     this.hud.update(rawDt);
     this.hud.updatePopups(rawDt, cam, this.renderer.width, this.renderer.height);
-    this.labels.update(rawDt, this.stream.live, this.stream.liveCount, p.weight,
+    this.labels.update(rawDt, all, this._mergedCount, p.weight,
       cam, this.renderer.width, this.renderer.height);
 
     this.chromatic = Math.max(0, this.chromatic - TUNING.post.chromaticDecay * rawDt);
@@ -693,6 +756,7 @@ export class Game {
     this.trail.dispose();
     this.roller.dispose();
     this.particles.dispose();
+    this.traffic.dispose();
     this.squash.dispose();
     this.fragments.dispose();
     this.decals.dispose();
