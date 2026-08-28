@@ -1,6 +1,11 @@
 import * as THREE from 'three/webgpu';
 import { uv, vec3, float, smoothstep } from 'three/tsl';
 import { TUNING, classify } from '../tuning.js';
+// One definition, in the module that owns the speed model. This was duplicated
+// here, which meant a change to the player's speed curve would silently only
+// take effect on half the game.
+export { speedAtWeight } from '../world/trackplan.js';
+import { speedAtWeight } from '../world/trackplan.js';
 import { clamp01, clamp, DEG, smoothstep as sstep } from '../core/math.js';
 
 /**
@@ -137,16 +142,6 @@ export function sampleRamp(t, intensity, out) {
   return out;
 }
 
-/**
- * Top speed the player will be doing at a given weight. Duplicated from
- * `world/trackplan.js` (which Module A may not import) so "seconds of travel
- * ahead" can be turned into metres from `playerWeight` alone. Same formula, same
- * TUNING fields, read at call time.
- */
-export function speedAtWeight(weight) {
-  const P = TUNING.player;
-  return Math.min(P.topSpeedCap, P.baseTopSpeed * Math.pow(weight / P.startWeight, P.topSpeedExp));
-}
 
 /* ─────────────────────────────────────────────────── module-level scratch ── */
 

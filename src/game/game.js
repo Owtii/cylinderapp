@@ -46,6 +46,7 @@ const OVER = 'over';
 const AS = {
   speed: 0, speed01: 0, weight: 0, grounded: true,
   airborne: false, timeScale: 1, playing: false, chain: 0, zone: 0,
+  blockerDistance: Infinity,
 };
 
 export class Game {
@@ -236,6 +237,29 @@ export class Game {
       time: this.runTime,
       best: this.score.best,
     });
+  }
+
+  /**
+   * Distance to the next blocker the player would actually hit if they held this
+   * line. Feeds the low warning hum in the rolling layer.
+   *
+   * Lateral gating is the whole point: a blocker three lanes over is scenery, and
+   * humming for it would train the player to ignore the hum. The band widens with
+   * the drum, because a 5 m drum has far less room to be wrong about which lane it
+   * is in than a 1.7 m one.
+   */
+  _nearestBlockerAhead(p) {
+    const band = p.halfWidth + TUNING.read.blockerSafeMargin;
+    let best = Infinity;
+    for (let i = 0; i < this.stream.liveCount; i++) {
+      const e = this.stream.live[i];
+      if (!e.alive || !e.blocker) continue;
+      const ahead = e.d - p.d;
+      if (ahead <= 0 || ahead >= best) continue;
+      if (Math.abs(p.x - e.cx) > e.ex + band) continue;
+      best = ahead;
+    }
+    return best;
   }
 
   _applyVolume(kind, v) {
@@ -523,6 +547,7 @@ export class Game {
     AS.grounded = p.grounded; AS.airborne = !p.grounded;
     AS.timeScale = this.loop.timeScale; AS.playing = playing;
     AS.chain = this.score.chain; AS.zone = this.stream.zoneIndex;
+    AS.blockerDistance = playing ? this._nearestBlockerAhead(p) : Infinity;
     audio.update(rawDt, AS);
     if (!this.loop.inSlowmo && audio.setFilterSweep) audio.setFilterSweep(0);
 
