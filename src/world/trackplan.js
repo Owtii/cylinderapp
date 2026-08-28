@@ -1074,17 +1074,38 @@ export function bestPossibleWeight(plan) {
  */
 export function buildTrackPlan(seed) {
   const need = TUNING.finale.houseWeight * TUNING.weights.winHeadroom;
+  // A track must also leave GOLD on the table. Measured over 40 seeds, the win gate
+  // alone let one seed in forty top out below 1.5x the house even on a perfect line,
+  // which for a shared daily seed means somebody gets a day where the top medal is
+  // arithmetically impossible and no amount of skill reaches it. The rebuild loop
+  // already lightens the landmark ladder each attempt, and lighter landmarks turn
+  // green sooner and so raise the ceiling, which is exactly the lever this needs.
+  const goldNeed = TUNING.finale.houseWeight * TUNING.medals.gold;
   let plan = null;
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const scale = 1 - attempt * 0.10;
-    plan = assemble(seed, scale);
+  let best = null;
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const scale = 1 - Math.min(4, attempt) * 0.10;
+    // Later attempts also re-roll the LAYOUT, not just the landmark weights. Seed
+    // 3714 was the case that forced this: it settled at scale 1.00 with a ceiling
+    // 18,510 kg short of gold, and lightening its landmarks did nothing, because
+    // what capped it was geometry — formations that fall where the roller cannot
+    // sweep them. Salting the generator's rng explores genuinely different layouts
+    // while the track stays a pure function of `seed`, so a daily seed is still the
+    // same track for everybody.
+    const salt = attempt === 0 ? 0 : Math.imul(attempt, 0x9e3779b9) >>> 0;
+    plan = assemble((seed ^ salt) >>> 0, scale);
+    plan.seed = seed >>> 0;                      // identity is the ORIGINAL seed
+    plan.attempt = attempt;
     plan.bestPossible = bestPossibleWeight(plan);
     // The ceiling including the traffic the plan reserved but did not place. Only
-    // for reading the medal ladder against — the gate above uses the proven number.
+    // for reading the medal ladder against — the win gate uses the proven number.
     plan.ceilingEstimate = plan.bestPossible +
       plan.trafficBudget * TUNING.weights.trafficCollectFraction;
     plan.centreScale = scale;
-    if (plan.bestPossible >= need) break;
+    // Keep the roomiest attempt seen, so a seed that never satisfies both gates
+    // still returns its best candidate rather than whichever one ran last.
+    if (!best || plan.ceilingEstimate > best.ceilingEstimate) best = plan;
+    if (plan.bestPossible >= need && plan.ceilingEstimate >= goldNeed) return plan;
   }
-  return plan;
+  return best;
 }
