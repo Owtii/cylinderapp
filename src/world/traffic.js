@@ -100,6 +100,7 @@ export class TrafficSystem {
     // Scratch for the per-zone weight solve. Sized to the largest zone count the
     // tuning table can ask for so the solve never allocates.
     this._zw = new Float64Array(cap);
+    this._seen = new Uint16Array(pool);      // distinct clump ids inside the near band
 
     this._ev = {
       count: 0,
@@ -660,14 +661,13 @@ export class TrafficSystem {
     const maxVisible = Math.min(T.maxVisible, Math.max(0, R.maxVisibleObjects - this.reservedVisible));
     const maxNear = Math.min(T.maxNear, Math.max(0, R.maxNearObjects - this.reservedNear));
 
-    let visible = 0, near = 0;
+    let visible = 0;
     for (let i = 0; i < this._liveCount; i++) {
       const v = this._live[i];
       v.visible = v.alive && v.d >= playerD - 20;
-      if (!v.visible) continue;
-      visible++;
-      if (v.d <= nearEnd) near++;
+      if (v.visible) visible++;
     }
+    let near = this._nearClusters(playerD, nearEnd);
 
     let guard = 0;
     while ((visible > maxVisible || near > maxNear) && guard++ < this._live.length) {
@@ -685,9 +685,9 @@ export class TrafficSystem {
       if (victim < 0) break;
       const v = this._live[victim];
       visible--;
-      if (v.d <= nearEnd) near--;
       this._retire(v, true);
       v.visible = false;
+      near = this._nearClusters(playerD, nearEnd);
     }
 
     // Compact out anything the cull killed, so `live[0..liveCount)` stays dense.
@@ -699,6 +699,28 @@ export class TrafficSystem {
       w++;
     }
     this._liveCount = w;
+  }
+
+  /**
+   * Distinct clumps inside the near band.
+   *
+   * §6.1's near-band cap counts DECISIONS, and a clump of four cars abreast is one:
+   * they are all paper, and the only choice is which lane to take them in. Counting
+   * each car separately would have the cull delete the clump the moment it became
+   * interesting, which is the opposite of what the cap is for. Vehicles still count
+   * one for one against the VISIBLE cap, where the cost really is per silhouette.
+   */
+  _nearClusters(playerD, nearEnd) {
+    const seen = this._seen;
+    let n = 0;
+    for (let i = 0; i < this._liveCount; i++) {
+      const v = this._live[i];
+      if (!v.visible || v.d > nearEnd) continue;
+      let dup = false;
+      for (let j = 0; j < n; j++) if (seen[j] === v.cluster) { dup = true; break; }
+      if (!dup && n < seen.length) seen[n++] = v.cluster;
+    }
+    return n;
   }
 
   /**
@@ -818,17 +840,19 @@ function insertionSortSchedule(sys) {
   const n = sys._scount;
   for (let i = 1; i < n; i++) {
     const d = sys._sd[i], w = sys._sw[i], s = sys._ss[i], nv = sys._sn[i];
-    const f = sys._sf[i], k = sys._sk[i], l = sys._sl[i], z = sys._sz[i];
+    const f = sys._sf[i], k = sys._sk[i], l = sys._sl[i], z = sys._sz[i], c = sys._sc[i];
     let j = i - 1;
     while (j >= 0 && sys._sd[j] > d) {
       sys._sd[j + 1] = sys._sd[j]; sys._sw[j + 1] = sys._sw[j];
       sys._ss[j + 1] = sys._ss[j]; sys._sn[j + 1] = sys._sn[j];
       sys._sf[j + 1] = sys._sf[j]; sys._sk[j + 1] = sys._sk[j];
       sys._sl[j + 1] = sys._sl[j]; sys._sz[j + 1] = sys._sz[j];
+      sys._sc[j + 1] = sys._sc[j];
       j--;
     }
     sys._sd[j + 1] = d; sys._sw[j + 1] = w; sys._ss[j + 1] = s; sys._sn[j + 1] = nv;
     sys._sf[j + 1] = f; sys._sk[j + 1] = k; sys._sl[j + 1] = l; sys._sz[j + 1] = z;
+    sys._sc[j + 1] = c;
   }
 }
 
